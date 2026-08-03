@@ -22,6 +22,12 @@ VERT_ORIGINAL = "ORIGINAL"
 VERT_BOUNDARY = "BOUNDARY"
 VERT_GENERATED = "GENERATED"
 
+INNER_CAP_NGON = "NGON"
+INNER_CAP_FAN = "FAN"
+INNER_CAP_ADJ_LITE = "ADJ_LITE"
+INNER_CAP_AUTO = "AUTO"
+
+DEFAULT_INNER_CAP_MODE = INNER_CAP_ADJ_LITE
 
 class BX_TransactionVertex(object):
     def __init__(self,
@@ -683,7 +689,7 @@ def build_reconstructed_face_for_selection(transaction,
     # If the rebuilt face is a large all-boundary polygon, turn it into
     # an explicit cap instead of a normal reconstructed face.
     if should_build_inner_cap_face(transaction=transaction, face_indices=rebuilt_tx_ids):
-        build_inner_cap_fan(
+        build_inner_cap_auto(
             transaction=transaction,
             bm=bm,
             face_id=face_id,
@@ -875,6 +881,231 @@ def build_inner_cap_fan(transaction, bm, face_id, face_indices):
 
     return patch_faces
 
+def build_inner_cap_adj_lite(transaction,
+                             bm,
+                             face_id,
+                             face_indices,
+                             inner_scale=0.45):
+    """
+    Build first M_ADJ-lite inner cap.
+
+    This replaces one big ngon or one triangle fan with:
+        - generated inner ring
+        - F_PATCH quad ring
+        - F_CAP center polygon
+
+    It is not full Blender M_ADJ yet. It is a stable, readable,
+    segments=1 patch that avoids fan spokes across the whole cap.
+    """
+    print("[BevelX] Inner cap ADJ_LITE entered on face {0}: outer verts={1}".format(
+        face_id,
+        face_indices
+    ))
+
+
+    face = bm.faces[face_id]
+
+    expected_normal = list(face.normal_world)
+    face_center = list(face.center_world)
+
+    sorted_outer_ids = sort_transaction_vertices_on_face(
+        transaction=transaction,
+        vertex_ids=face_indices,
+        face_center=face_center,
+        face_normal=expected_normal
+    )
+
+    sorted_outer_ids = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=sorted_outer_ids,
+        expected_normal=expected_normal
+    )
+
+    if len(sorted_outer_ids) < 3:
+        print("[BevelX] F_PATCH ADJ_LITE skipped for face {0}: fewer than 3 boundary verts.".format(
+            face_id
+        ))
+        return []
+
+    center = calculate_transaction_polygon_center(
+        transaction=transaction,
+        vertex_ids=sorted_outer_ids
+    )
+
+    inner_ids = []
+
+    for outer_id in sorted_outer_ids:
+        outer_point = transaction.vertices[outer_id].co_world
+
+        inner_point = bxm.lerp(
+            outer_point,
+            center,
+            inner_scale
+        )
+
+        inner_id = transaction.add_generated_vertex(inner_point)
+        inner_ids.append(inner_id)
+
+    created_faces = []
+    count = len(sorted_outer_ids)
+
+    # 1. Build quad ring.
+    for i in range(count):
+        outer_a = sorted_outer_ids[i]
+        outer_b = sorted_outer_ids[(i + 1) % count]
+        inner_b = inner_ids[(i + 1) % count]
+        inner_a = inner_ids[i]
+
+        quad_ids = [
+            outer_a,
+            outer_b,
+            inner_b,
+            inner_a
+        ]
+
+        quad_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=quad_ids,
+            expected_normal=expected_normal
+        )
+
+        area = transaction_polygon_area(
+            transaction=transaction,
+            vertex_ids=quad_ids
+        )
+
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=quad_ids
+        ):
+            print("[BevelX] F_PATCH ADJ_LITE skipped degenerate quad on face {0}: verts={1}, area={2}".format(
+                face_id,
+                quad_ids,
+                area
+            ))
+            continue
+
+        patch_face = transaction.add_face(
+            vertex_ids=quad_ids,
+            face_kind=FACE_PATCH,
+            source_face_id=face_id,
+            expected_normal=expected_normal
+        )
+
+        created_faces.append(patch_face)
+
+    # 2. Build center cap polygon.
+    center_cap_ids = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=inner_ids,
+        expected_normal=expected_normal
+    )
+
+    center_area = transaction_polygon_area(
+        transaction=transaction,
+        vertex_ids=center_cap_ids
+    )
+
+    if is_degenerate_transaction_polygon(
+        transaction=transaction,
+        vertex_ids=center_cap_ids
+    ):
+        print("[BevelX] F_CAP ADJ_LITE skipped degenerate center cap on face {0}: verts={1}, area={2}".format(
+            face_id,
+            center_cap_ids,
+            center_area
+        ))
+    else:
+        center_face = transaction.add_face(
+            vertex_ids=center_cap_ids,
+            face_kind=FACE_CAP,
+            source_face_id=face_id,
+            expected_normal=expected_normal
+        )
+
+        created_faces.append(center_face)
+
+    if len(created_faces) == 0:
+        print("[BevelX] F_PATCH ADJ_LITE failed on face {0}: no patch faces built.".format(
+            face_id
+        ))
+    print("[BevelX] Inner cap ADJ_LITE built on face {0}: inner verts={1}, faces={2}".format(
+        face_id,
+        inner_ids,
+        len(created_faces)
+    ))
+
+    return created_faces
+
+def build_inner_cap_auto(transaction, bm, face_id, face_indices):
+    """
+    First Auto mode.
+
+    Current strategy:
+        1. Try ADJ_LITE.
+        2. Fallback to FAN.
+        3. Fallback to NGON.
+    """
+
+    print("[BevelX] Inner cap AUTO entered on face {0}: verts={1}".format(
+        face_id,
+        face_indices
+    ))
+
+    faces = build_inner_cap_adj_lite(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        face_indices=face_indices
+    )
+
+    if faces:
+        print("[BevelX] Inner cap AUTO used ADJ_LITE on face {0}: built {1} faces.".format(
+            face_id,
+            len(faces)
+        ))
+        return faces
+
+    print("[BevelX] Inner cap AUTO ADJ_LITE failed on face {0}; falling back to FAN.".format(
+        face_id
+    ))
+
+    faces = build_inner_cap_fan(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        face_indices=face_indices
+    )
+
+    if faces:
+        print("[BevelX] Inner cap AUTO fallback used FAN on face {0}: built {1} faces.".format(
+            face_id,
+            len(faces)
+        ))
+        return faces
+
+    print("[BevelX] Inner cap AUTO FAN failed on face {0}; falling back to NGON.".format(
+        face_id
+    ))
+
+    face = build_inner_cap_face(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        face_indices=face_indices
+    )
+
+    if face:
+        print("[BevelX] Inner cap AUTO fallback used NGON on face {0}.".format(
+            face_id
+        ))
+        return [face]
+
+    print("[BevelX] Inner cap AUTO failed on face {0}.".format(
+        face_id
+    ))
+
+    return []
 
 def calculate_transaction_polygon_center(transaction, vertex_ids):
     """
@@ -1039,6 +1270,42 @@ def transaction_triangle_area(transaction, vertex_ids):
         points[2]
     )
 
+def transaction_polygon_area(transaction, vertex_ids):
+    """
+    Approximate polygon area by triangulating from the first vertex.
+
+    Works well enough for degenerate checks on mostly planar patch faces.
+    """
+
+    if len(vertex_ids) < 3:
+        return 0.0
+
+    first = transaction.vertices[vertex_ids[0]].co_world
+    area = 0.0
+
+    for i in range(1, len(vertex_ids) - 1):
+        a = first
+        b = transaction.vertices[vertex_ids[i]].co_world
+        c = transaction.vertices[vertex_ids[i + 1]].co_world
+
+        area += triangle_area_from_points(a, b, c)
+
+    return area
+
+
+def is_degenerate_transaction_polygon(transaction,
+                                      vertex_ids,
+                                      area_epsilon=1.0e-8):
+    """
+    Return True if polygon has near-zero area.
+    """
+
+    area = transaction_polygon_area(
+        transaction=transaction,
+        vertex_ids=vertex_ids
+    )
+
+    return area <= area_epsilon
 
 def is_degenerate_transaction_triangle(transaction,
                                        vertex_ids,
