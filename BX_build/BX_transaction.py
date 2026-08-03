@@ -834,6 +834,29 @@ def build_inner_cap_fan(transaction, bm, face_id, face_indices):
             expected_normal=expected_normal
         )
 
+        if len(tri_ids) != 3:
+            print("[BevelX] F_PATCH skipped non-triangle fan face on face {0}: verts={1}".format(
+                face_id,
+                tri_ids
+            ))
+            continue
+
+        area = transaction_triangle_area(
+            transaction=transaction,
+            vertex_ids=tri_ids
+        )
+
+        if is_degenerate_transaction_triangle(
+            transaction=transaction,
+            vertex_ids=tri_ids
+        ):
+            print("[BevelX] F_PATCH skipped degenerate fan triangle on face {0}: verts={1}, area={2}".format(
+                face_id,
+                tri_ids,
+                area
+            ))
+            continue
+
         patch_face = transaction.add_face(
             vertex_ids=tri_ids,
             face_kind=FACE_PATCH,
@@ -842,6 +865,13 @@ def build_inner_cap_fan(transaction, bm, face_id, face_indices):
         )
 
         patch_faces.append(patch_face)
+
+    if len(patch_faces) != count:
+        print("[BevelX] F_PATCH fan warning on face {0}: built {1}/{2} triangles.".format(
+            face_id,
+            len(patch_faces),
+            count
+        ))
 
     return patch_faces
 
@@ -971,6 +1001,58 @@ def build_edge_face(transaction, edge_data, vertex_boundaries):
         expected_normal=expected_normal
     )
 
+# -----------------------------------------------------------------------------
+# Degenerate face checks
+# -----------------------------------------------------------------------------
+
+def triangle_area_from_points(a, b, c):
+    """
+    Return triangle area from three world-space points.
+    """
+
+    ab = bxm.sub(b, a)
+    ac = bxm.sub(c, a)
+
+    cross_value = bxm.cross(ab, ac)
+
+    return 0.5 * bxm.length(cross_value)
+
+
+def transaction_triangle_area(transaction, vertex_ids):
+    """
+    Return area for a transaction triangle.
+
+    If vertex_ids is not a triangle, return 0.0.
+    """
+
+    if len(vertex_ids) != 3:
+        return 0.0
+
+    points = [
+        transaction.vertices[tx_id].co_world
+        for tx_id in vertex_ids
+    ]
+
+    return triangle_area_from_points(
+        points[0],
+        points[1],
+        points[2]
+    )
+
+
+def is_degenerate_transaction_triangle(transaction,
+                                       vertex_ids,
+                                       area_epsilon=1.0e-8):
+    """
+    Return True if triangle has near-zero area.
+    """
+
+    area = transaction_triangle_area(
+        transaction=transaction,
+        vertex_ids=vertex_ids
+    )
+
+    return area <= area_epsilon
 
 # -----------------------------------------------------------------------------
 # F_RECON faces
