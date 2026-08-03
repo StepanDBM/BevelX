@@ -16,6 +16,7 @@ FACE_EDGE = "F_EDGE"
 FACE_VERT = "F_VERT"
 FACE_CAP = "F_CAP"
 FACE_PATCH = "F_PATCH"
+FACE_INNER_MITER_PATCH = "F_INNER_MITER_PATCH"
 FACE_RECON = "F_RECON"
 
 VERT_ORIGINAL = "ORIGINAL"
@@ -403,7 +404,7 @@ def can_build_edge_face_from_boundaries(edge_data, vertex_boundaries):
 
     return None not in required
 
-def build_selection_transaction(edges_data, vertex_boundaries, bm=None):
+def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_vertices=None):
     """
     Build a full preview/apply transaction for a selected edge set.
 
@@ -436,7 +437,9 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None):
         transaction=transaction,
         vertex_boundaries=vertex_boundaries
     )
-
+    debug_inner_miter_candidates(bevel_vertices=bevel_vertices,
+                                 vertex_boundaries=vertex_boundaries,
+                                 central_face_id=None)
     if bm is None:
         return transaction
 
@@ -458,7 +461,8 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None):
             bm=bm,
             face_id=face_id,
             affected_vertex_ids=affected_vertex_ids,
-            vertex_boundaries=vertex_boundaries
+            vertex_boundaries=vertex_boundaries,
+            bevel_vertices=bevel_vertices
         )
 
     return transaction
@@ -467,6 +471,178 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None):
 # -----------------------------------------------------------------------------
 # F_CAP / inner face cap helpers
 # -----------------------------------------------------------------------------
+def is_chain2_inner_miter_candidate(bevel_vertex,
+                                    vertex_boundaries,
+                                    central_face_id=None):
+    """
+    Return True if this bevel vertex is a first-pass candidate for
+    INNER_MITER_PATCH.
+
+    Boundary data lives in vertex_boundaries, not on BX_BevelVertex.
+    """
+
+    vertex_id = getattr(bevel_vertex, "vertex_id", None)
+
+    if vertex_id is None:
+        return False
+
+    kind = getattr(bevel_vertex, "kind", None)
+    selected_count = getattr(bevel_vertex, "selected_count", None)
+
+    if kind != "CHAIN_2":
+        return False
+
+    if selected_count != 2:
+        return False
+
+    boundary_vertices = vertex_boundaries.get(vertex_id, [])
+
+    if len(boundary_vertices) < 4:
+        return False
+
+    if central_face_id is None:
+        return True
+
+    # Important: CHAIN_2 boundary verts are usually on neighboring support faces,
+    # not necessarily directly on central face 1. So do not require face 1 here
+    # unless you specifically want that filter.
+    return True
+
+def get_bevel_vertex_selected_edges(bevel_vertex):
+    """
+    Return selected / beveled edge ids from a BX_BevelVertex.
+
+    This avoids relying on a stored selected_count field.
+    """
+
+    selected_edges = getattr(bevel_vertex, "selected_edges", None)
+
+    if selected_edges is not None:
+        return list(selected_edges)
+
+    edge_halves = getattr(bevel_vertex, "edge_halves", None)
+
+    if not edge_halves:
+        return []
+
+    result = []
+
+    for edge_half in edge_halves:
+        if getattr(edge_half, "beveled", False):
+            edge_id = getattr(edge_half, "edge_id", getattr(edge_half, "edge", None))
+
+            if edge_id is not None:
+                result.append(edge_id)
+
+    return result
+
+
+def debug_inner_miter_candidates(bevel_vertices,
+                                 vertex_boundaries,
+                                 central_face_id=None):
+    """
+    Print likely INNER_MITER_PATCH candidates.
+
+    For the current BevelX data model:
+        - topology kind may not be stored on BX_BevelVertex
+        - selected_count may not be stored on BX_BevelVertex
+        - boundary data lives in vertex_boundaries
+
+    First-pass candidate rule:
+        - exactly 2 selected/beveled edges
+        - exactly 4 boundary vertices
+
+    This catches current CHAIN_2 vertices:
+        40, 41, 42, 43
+    and excludes current CORNER_2 vertices:
+        46, 47, 50, 51, 54, 55, 58, 59
+    """
+
+    if bevel_vertices is None:
+        print("[BevelX] INNER_MITER debug skipped: bevel_vertices is None.")
+        return
+
+    if vertex_boundaries is None:
+        print("[BevelX] INNER_MITER debug skipped: vertex_boundaries is None.")
+        return
+
+    if hasattr(bevel_vertices, "items"):
+        iterator = bevel_vertices.items()
+    else:
+        iterator = []
+
+        for bevel_vertex in bevel_vertices:
+            vertex_id = getattr(
+                bevel_vertex,
+                "vertex_id",
+                getattr(bevel_vertex, "id", None)
+            )
+
+            iterator.append((vertex_id, bevel_vertex))
+
+    found = 0
+
+    for vertex_id, bevel_vertex in iterator:
+        if vertex_id is None:
+            continue
+
+        selected_edges = get_bevel_vertex_selected_edges(bevel_vertex)
+        boundary_vertices = vertex_boundaries.get(vertex_id, [])
+
+        selected_count = len(selected_edges)
+        boundary_count = len(boundary_vertices)
+
+        print("[BevelX] INNER_MITER inspect vertex {0}: selected_edges={1}, boundary_count={2}".format(
+            vertex_id,
+            selected_edges,
+            boundary_count
+        ))
+
+        if selected_count != 2:
+            continue
+
+        if boundary_count != 4:
+            continue
+
+        found += 1
+
+        boundary_debug = []
+
+        for boundary_vertex in boundary_vertices:
+            boundary_debug.append(
+                "{0}: face={1}, edge={2}".format(
+                    getattr(boundary_vertex, "id", "?"),
+                    boundary_vertex_face_id(boundary_vertex),
+                    getattr(boundary_vertex, "edge", getattr(boundary_vertex, "edge_id", "?"))
+                )
+            )
+
+        print("[BevelX] INNER_MITER candidate vertex {0}:".format(vertex_id))
+        print("[BevelX]   selected_edges={0}, boundary_count={1}".format(
+            selected_edges,
+            boundary_count
+        ))
+        print("[BevelX]   boundaries: {0}".format(boundary_debug))
+
+    print("[BevelX] INNER_MITER candidate debug found {0} candidates.".format(
+        found
+    ))
+
+#######################################################
+# just for now, I really am unsure of this values. debug print shows BX_BoundaryVertex(... face=44 ...), so...
+#######################################################
+def boundary_vertex_face_id(boundary_vertex):
+    """
+    Return face id from a BX_BoundaryVertex, tolerating naming differences.
+    """
+
+    if hasattr(boundary_vertex, "face_id"):
+        return boundary_vertex.face_id
+
+    if hasattr(boundary_vertex, "face"):
+        return boundary_vertex.face
+
+    return None
 
 def should_build_inner_cap_face(transaction, face_indices):
     """
@@ -600,7 +776,8 @@ def build_reconstructed_face_for_selection(transaction,
                                            bm,
                                            face_id,
                                            affected_vertex_ids,
-                                           vertex_boundaries):
+                                           vertex_boundaries,
+                                           bevel_vertices=None):
     """
     Build F_RECON for a face affected by a selected edge set.
 
@@ -693,7 +870,9 @@ def build_reconstructed_face_for_selection(transaction,
             transaction=transaction,
             bm=bm,
             face_id=face_id,
-            face_indices=rebuilt_tx_ids
+            face_indices=rebuilt_tx_ids,
+            bevel_vertices=bevel_vertices,
+            vertex_boundaries=vertex_boundaries
         )
 
         return None
@@ -885,7 +1064,9 @@ def build_inner_cap_adj_lite(transaction,
                              bm,
                              face_id,
                              face_indices,
-                             inner_scale=0.45):
+                             inner_scale=0.45,
+                             bevel_vertices=None,
+                             vertex_boundaries=None):
     """
     Build first M_ADJ-lite inner cap.
 
@@ -948,7 +1129,7 @@ def build_inner_cap_adj_lite(transaction,
 
     created_faces = []
     count = len(sorted_outer_ids)
-
+    
     # 1. Build quad ring.
     for i in range(count):
         outer_a = sorted_outer_ids[i]
@@ -985,12 +1166,45 @@ def build_inner_cap_adj_lite(transaction,
             ))
             continue
 
+        orig_a = get_transaction_vertex_original_id(transaction, outer_a)
+        orig_b = get_transaction_vertex_original_id(transaction, outer_b)
+
+        print("[BevelX] ADJ_LITE segment inspect: outer=({0},{1}) orig=({2},{3})".format(
+            outer_a,
+            outer_b,
+            orig_a,
+            orig_b
+        ))
+
+        face_kind = FACE_PATCH
+
+        if bevel_vertices is not None and vertex_boundaries is not None:
+            if should_use_inner_miter_patch_for_outer_pair(
+                transaction=transaction,
+                outer_a_id=outer_a,
+                outer_b_id=outer_b,
+                bevel_vertices=bevel_vertices,
+                vertex_boundaries=vertex_boundaries
+            ):
+                face_kind = FACE_INNER_MITER_PATCH
+
         patch_face = transaction.add_face(
-            vertex_ids=quad_ids,
-            face_kind=FACE_PATCH,
-            source_face_id=face_id,
-            expected_normal=expected_normal
+            vertex_ids=[outer_a, outer_b, inner_b, inner_a],
+            face_kind=face_kind,
+            source_face_id=face_id
         )
+
+        if face_kind == FACE_INNER_MITER_PATCH:
+            orig_id = get_transaction_vertex_original_id(
+                transaction=transaction,
+                tx_id=outer_a
+            )
+
+            print("[BevelX] INNER_MITER_PATCH classified on face {0}, vertex {1}: verts={2}".format(
+                face_id,
+                orig_id,
+                [outer_a, outer_b, inner_b, inner_a]
+            ))
 
         created_faces.append(patch_face)
 
@@ -1037,7 +1251,12 @@ def build_inner_cap_adj_lite(transaction,
 
     return created_faces
 
-def build_inner_cap_auto(transaction, bm, face_id, face_indices):
+def build_inner_cap_auto(transaction,
+                         bm,
+                         face_id,
+                         face_indices,
+                         bevel_vertices=None,
+                         vertex_boundaries=None):
     """
     First Auto mode.
 
@@ -1056,7 +1275,9 @@ def build_inner_cap_auto(transaction, bm, face_id, face_indices):
         transaction=transaction,
         bm=bm,
         face_id=face_id,
-        face_indices=face_indices
+        face_indices=face_indices,
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries
     )
 
     if faces:
@@ -1106,6 +1327,110 @@ def build_inner_cap_auto(transaction, bm, face_id, face_indices):
     ))
 
     return []
+
+
+def get_transaction_vertex_original_id(transaction, tx_id):
+    """
+    Return original vertex id from a transaction vertex.
+    """
+
+    tx_vertex = transaction.vertices[tx_id]
+
+    if hasattr(tx_vertex, "original_vertex_id"):
+        return tx_vertex.original_vertex_id
+
+    if hasattr(tx_vertex, "orig_v"):
+        return tx_vertex.orig_v
+
+    return None
+
+
+def get_bevel_vertex_by_id(bevel_vertices, vertex_id):
+    """
+    Return BX_BevelVertex by id from dict or list storage.
+    """
+
+    if bevel_vertices is None:
+        return None
+
+    if hasattr(bevel_vertices, "get"):
+        return bevel_vertices.get(vertex_id)
+
+    for bevel_vertex in bevel_vertices:
+        if getattr(bevel_vertex, "vertex_id", None) == vertex_id:
+            return bevel_vertex
+
+    return None
+
+
+def is_inner_miter_candidate_vertex_id(vertex_id,
+                                       bevel_vertices,
+                                       vertex_boundaries):
+    """
+    First real INNER_MITER candidate test.
+
+    Current rule:
+        - bevel vertex exists
+        - exactly two selected/beveled edges
+        - exactly four boundary vertices
+
+    This catches current CHAIN_2 candidates and excludes current CORNER_2.
+    """
+
+    bevel_vertex = get_bevel_vertex_by_id(
+        bevel_vertices=bevel_vertices,
+        vertex_id=vertex_id
+    )
+
+    if bevel_vertex is None:
+        return False
+
+    selected_edges = get_bevel_vertex_selected_edges(bevel_vertex)
+    boundaries = vertex_boundaries.get(vertex_id, [])
+
+    if len(selected_edges) != 2:
+        return False
+
+    if len(boundaries) != 4:
+        return False
+
+    return True
+
+
+def should_use_inner_miter_patch_for_outer_pair(transaction,
+                                                outer_a_id,
+                                                outer_b_id,
+                                                bevel_vertices,
+                                                vertex_boundaries):
+    """
+    Return True when an ADJ-lite outer segment belongs to one CHAIN_2
+    original vertex.
+
+    In the central loop, a CHAIN_2 miter segment appears as two adjacent
+    boundary tx verts with the same original vertex id.
+    """
+
+    orig_a = get_transaction_vertex_original_id(
+        transaction=transaction,
+        tx_id=outer_a_id
+    )
+
+    orig_b = get_transaction_vertex_original_id(
+        transaction=transaction,
+        tx_id=outer_b_id
+    )
+
+    if orig_a is None or orig_b is None:
+        return False
+
+    if orig_a != orig_b:
+        return False
+
+    return is_inner_miter_candidate_vertex_id(
+        vertex_id=orig_a,
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries
+    )
 
 def calculate_transaction_polygon_center(transaction, vertex_ids):
     """

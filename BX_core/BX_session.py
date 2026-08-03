@@ -242,7 +242,8 @@ def start_or_rebuild_session(settings=None, rail_builder=None):
             session.selection_transaction = BX_transaction.build_selection_transaction(
                 edges_data=session.edges_data,
                 vertex_boundaries=selection_boundaries,
-                bm=session.bm
+                bm=session.bm,
+                bevel_vertices=session.bevel_vertices
             )
 
             if not session.selection_transaction.faces:

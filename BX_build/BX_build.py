@@ -194,9 +194,10 @@ def get_transaction_faces_in_apply_order(transaction):
     order = {
         "F_EDGE": 0,
         "F_VERT": 1,
-        "F_CAP": 2,
+        "F_INNER_MITER_PATCH": 2,
         "F_PATCH": 3,
-        "F_RECON": 4,
+        "F_CAP": 4,
+        "F_RECON": 5,
     }
 
     return sorted(
