@@ -14,10 +14,13 @@ from BX_math import BX_math as bxm
 FACE_ORIG = "F_ORIG"
 FACE_EDGE = "F_EDGE"
 FACE_VERT = "F_VERT"
+FACE_CAP = "F_CAP"
+FACE_PATCH = "F_PATCH"
 FACE_RECON = "F_RECON"
 
 VERT_ORIGINAL = "ORIGINAL"
 VERT_BOUNDARY = "BOUNDARY"
+VERT_GENERATED = "GENERATED"
 
 
 class BX_TransactionVertex(object):
@@ -161,6 +164,31 @@ class BX_BevelTransaction(object):
     # -------------------------------------------------------------------------
     # Face creation
     # -------------------------------------------------------------------------
+    def add_generated_vertex(self, co_world):
+        """
+        Add a generated transaction vertex.
+
+        Used for:
+            - F_CAP fan centers
+            - future F_PATCH center points
+            - future VMesh generated vertices
+        """
+
+        vertex_id = len(self.vertices)
+
+        vertex = BX_TransactionVertex(
+            vertex_id=vertex_id,
+            co_world=co_world,
+            source=VERT_GENERATED,
+            original_vertex_id=None,
+            boundary_id=None,
+            selected_edge_id=None,
+            face_id=None
+        )
+
+        self.vertices.append(vertex)
+
+        return vertex_id
 
     def add_face(self,
                  vertex_ids,
@@ -430,6 +458,138 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None):
     return transaction
     
 
+# -----------------------------------------------------------------------------
+# F_CAP / inner face cap helpers
+# -----------------------------------------------------------------------------
+
+def should_build_inner_cap_face(transaction, face_indices):
+    """
+    Return True if a rebuilt source face should become an inner cap.
+
+    First conservative rule:
+        - rebuilt face has 6 or more vertices
+        - all rebuilt vertices are boundary vertices
+
+    This avoids changing normal outer support faces that still contain
+    original corner vertices.
+    """
+
+    if len(face_indices) < 6:
+        return False
+
+    for tx_id in face_indices:
+        tx_vertex = transaction.vertices[tx_id]
+
+        if tx_vertex.source != VERT_BOUNDARY:
+            return False
+
+    return True
+
+
+def build_inner_cap_face(transaction, bm, face_id, face_indices):
+    """
+    Build a simple F_CAP polygon for a complex all-boundary reconstructed face.
+
+    This is the first INNER_CAP_NONE / M_POLY_CAP behavior:
+        - collect all boundary vertices from the rebuilt face
+        - sort them around the original source face center
+        - orient to the original source face normal
+        - add one F_CAP polygon
+
+    This is intentionally simple and predictable. Later Auto mode can
+    replace this with rail-intersection patching.
+    """
+
+    face = bm.faces[face_id]
+
+    expected_normal = list(face.normal_world)
+    face_center = list(face.center_world)
+
+    sorted_indices = sort_transaction_vertices_on_face(
+        transaction=transaction,
+        vertex_ids=face_indices,
+        face_center=face_center,
+        face_normal=expected_normal
+    )
+
+    sorted_indices = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=sorted_indices,
+        expected_normal=expected_normal
+    )
+
+    return transaction.add_face(
+        vertex_ids=sorted_indices,
+        face_kind=FACE_CAP,
+        source_face_id=face_id,
+        expected_normal=expected_normal
+    )
+
+
+def sort_transaction_vertices_on_face(transaction,
+                                      vertex_ids,
+                                      face_center,
+                                      face_normal):
+    """
+    Sort transaction vertices around face_center in the face plane.
+
+    This gives F_CAP a stable winding order for ngon cap faces.
+    """
+
+    import math
+
+    normal = bxm.normalize(face_normal)
+
+    if not vertex_ids:
+        return []
+
+    first_point = transaction.vertices[vertex_ids[0]].co_world
+
+    tangent = bxm.sub(first_point, face_center)
+
+    # Remove normal component from tangent.
+    tangent_normal_amount = bxm.dot(tangent, normal)
+    tangent = bxm.sub(
+        tangent,
+        bxm.mul(normal, tangent_normal_amount)
+    )
+
+    tangent = bxm.normalize(tangent)
+
+    if bxm.is_zero(tangent):
+        tangent = make_fallback_tangent(normal)
+
+    bitangent = bxm.normalize(
+        bxm.cross(normal, tangent)
+    )
+
+    def angle_for_id(tx_id):
+        point = transaction.vertices[tx_id].co_world
+        vector = bxm.sub(point, face_center)
+
+        x = bxm.dot(vector, tangent)
+        y = bxm.dot(vector, bitangent)
+
+        return math.atan2(y, x)
+
+    return sorted(vertex_ids, key=angle_for_id)
+
+
+def make_fallback_tangent(normal):
+    """
+    Build a stable tangent perpendicular to normal.
+    """
+
+    world_x = [1.0, 0.0, 0.0]
+    world_y = [0.0, 1.0, 0.0]
+
+    tangent = bxm.cross(normal, world_x)
+
+    if bxm.is_zero(tangent):
+        tangent = bxm.cross(normal, world_y)
+
+    return bxm.normalize(tangent)
+
 def build_reconstructed_face_for_selection(transaction,
                                            bm,
                                            face_id,
@@ -517,6 +677,19 @@ def build_reconstructed_face_for_selection(transaction,
     # Avoid degenerate faces.
     if len(rebuilt_tx_ids) < 3:
         print("[BevelX] F_RECON skipped for face {0}: fewer than 3 verts.".format(face_id))
+        return None
+
+    # Inner cap mode:
+    # If the rebuilt face is a large all-boundary polygon, turn it into
+    # an explicit cap instead of a normal reconstructed face.
+    if should_build_inner_cap_face(transaction=transaction, face_indices=rebuilt_tx_ids):
+        build_inner_cap_fan(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_indices=rebuilt_tx_ids
+        )
+
         return None
 
     return transaction.add_face(
@@ -607,6 +780,89 @@ def build_support_face_vertex_replacement(transaction,
         transaction.add_boundary_vertex(boundary_prev),
         transaction.add_boundary_vertex(boundary_next),
     ]
+
+def build_inner_cap_fan(transaction, bm, face_id, face_indices):
+    """
+    Build an explicit triangle fan for a complex inner cap.
+
+    This is the next version of INNER_CAP_NONE:
+        - sort boundary vertices around the source face center
+        - create one generated center vertex
+        - create F_PATCH triangles from center to each boundary edge
+
+    This avoids relying on Maya's internal triangulation of a large ngon.
+    """
+
+    face = bm.faces[face_id]
+
+    expected_normal = list(face.normal_world)
+    face_center = list(face.center_world)
+
+    sorted_indices = sort_transaction_vertices_on_face(
+        transaction=transaction,
+        vertex_ids=face_indices,
+        face_center=face_center,
+        face_normal=expected_normal
+    )
+
+    sorted_indices = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=sorted_indices,
+        expected_normal=expected_normal
+    )
+
+    center = calculate_transaction_polygon_center(
+        transaction=transaction,
+        vertex_ids=sorted_indices
+    )
+
+    center_id = transaction.add_generated_vertex(center)
+
+    count = len(sorted_indices)
+
+    patch_faces = []
+
+    for i in range(count):
+        a = sorted_indices[i]
+        b = sorted_indices[(i + 1) % count]
+
+        tri_ids = [center_id, a, b]
+
+        tri_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tri_ids,
+            expected_normal=expected_normal
+        )
+
+        patch_face = transaction.add_face(
+            vertex_ids=tri_ids,
+            face_kind=FACE_PATCH,
+            source_face_id=face_id,
+            expected_normal=expected_normal
+        )
+
+        patch_faces.append(patch_face)
+
+    return patch_faces
+
+
+def calculate_transaction_polygon_center(transaction, vertex_ids):
+    """
+    Average center of transaction vertices.
+    """
+
+    if not vertex_ids:
+        return [0.0, 0.0, 0.0]
+
+    center = [0.0, 0.0, 0.0]
+
+    for tx_id in vertex_ids:
+        center = bxm.add(
+            center,
+            transaction.vertices[tx_id].co_world
+        )
+
+    return bxm.div(center, float(len(vertex_ids)))
 
 # -----------------------------------------------------------------------------
 # F_VERT faces

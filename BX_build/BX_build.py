@@ -182,17 +182,29 @@ def print_unused_vertices(source_node):
 def get_transaction_faces_in_apply_order(transaction):
     """
     Return transaction faces in the order needed for local application.
+
+    Order:
+        F_EDGE  - bevel strips
+        F_VERT  - vertex caps
+        F_CAP   - inner face caps
+        F_PATCH - future patch faces
+        F_RECON - rebuilt source faces
     """
 
     order = {
         "F_EDGE": 0,
         "F_VERT": 1,
-        "F_RECON": 2,
+        "F_CAP": 2,
+        "F_PATCH": 3,
+        "F_RECON": 4,
     }
 
     return sorted(
         transaction.faces,
-        key=lambda face: order.get(getattr(face, "kind", getattr(face, "face_kind", None)), 99)
+        key=lambda face: order.get(
+            getattr(face, "kind", getattr(face, "face_kind", None)),
+            99
+        )
     )
 
 

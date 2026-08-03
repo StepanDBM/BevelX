@@ -69,10 +69,11 @@ def preview(settings=None):
         if session.last_error:
             log(session.last_error)
 
-            if not session.edges_data:
-                return settings
-
-            log("Preview is continuing in diagnostic mode.")
+            if session.last_error:
+                log(session.last_error)
+                if not session.edges_data:
+                    return settings
+                log("Preview is continuing in diagnostic mode.")
 
         if session.bm:
             session.bm.debug_print_summary()

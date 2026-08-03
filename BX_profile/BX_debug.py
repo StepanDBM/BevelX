@@ -496,12 +496,13 @@ def draw_transaction_faces(transaction):
         F_EDGE as orange debug quads.
     """
 
-    color_by_kind = {
-        "F_EDGE": (1.0, 0.45, 0.0),
-        "F_VERT": (0.8, 0.2, 1.0),
-        "F_RECON": (0.2, 0.8, 1.0),
-        "F_ORIG": (0.5, 0.5, 0.5),
-    }
+    color_by_kind ={
+    "F_EDGE": (1.0, 0.45, 0.0),
+    "F_VERT": (1.0, 0.0, 1.0),
+    "F_CAP": (0.2, 0.9, 1.0),
+    "F_PATCH": (0.6, 0.4, 1.0),
+    "F_RECON": (0.25, 0.8, 1.0),
+}
 
     for face in transaction.faces:
         points = transaction.get_face_world_points(face)
