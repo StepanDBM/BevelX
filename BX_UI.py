@@ -159,7 +159,7 @@ class BevelXUI(QtWidgets.QDialog):
         self.width_spin.setDecimals(4)
         self.width_spin.setMinimum(0.0)
         self.width_spin.setMaximum(100000.0)
-        self.width_spin.setSingleStep(0.01)
+        self.width_spin.setSingleStep(0.1)
         self.width_spin.setMinimumWidth(90)
 
         self.width_slider.setToolTip("Adaptive range. Type a larger width to expand slider max.")

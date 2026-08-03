@@ -432,14 +432,25 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_ve
             vertex_boundaries=vertex_boundaries
         )
 
-    # 2. Build vertex cap faces, currently TRI_CAP only.
+    # 2. Build vertex cap faces.
     build_vertex_cap_faces(
         transaction=transaction,
         vertex_boundaries=vertex_boundaries
     )
-    debug_inner_miter_candidates(bevel_vertices=bevel_vertices,
-                                 vertex_boundaries=vertex_boundaries,
-                                 central_face_id=None)
+
+    # 2b. Build CHAIN_2 inner miter vertex caps.
+    # These are the missing local triangles, not central ADJ-lite ring splits.
+    build_inner_miter_vertex_cap_faces(
+        transaction=transaction,
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries
+    )
+
+    debug_inner_miter_candidates(
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries,
+        central_face_id=None
+    )
     if bm is None:
         return transaction
 
@@ -1065,6 +1076,7 @@ def build_inner_cap_adj_lite(transaction,
                              face_id,
                              face_indices,
                              inner_scale=0.45,
+                             inner_miter_pull=0.25,
                              bevel_vertices=None,
                              vertex_boundaries=None):
     """
@@ -1113,9 +1125,33 @@ def build_inner_cap_adj_lite(transaction,
         vertex_ids=sorted_outer_ids
     )
 
+    count = len(sorted_outer_ids)
+
+    # Detect which outer segments are inner-miter segments before creating inner verts.
+    segment_is_inner_miter = []
+
+    for i in range(count):
+        outer_a = sorted_outer_ids[i]
+        outer_b = sorted_outer_ids[(i + 1) % count]
+
+        is_miter_segment = False
+
+        if bevel_vertices is not None and vertex_boundaries is not None:
+            is_miter_segment = should_use_inner_miter_patch_for_outer_pair(
+                transaction=transaction,
+                outer_a_id=outer_a,
+                outer_b_id=outer_b,
+                bevel_vertices=bevel_vertices,
+                vertex_boundaries=vertex_boundaries
+            )
+
+        segment_is_inner_miter.append(is_miter_segment)
+
+    # Generate inner ring.
+    # If an inner vertex touches an inner-miter segment, pull it farther toward center.
     inner_ids = []
 
-    for outer_id in sorted_outer_ids:
+    for i, outer_id in enumerate(sorted_outer_ids):
         outer_point = transaction.vertices[outer_id].co_world
 
         inner_point = bxm.lerp(
@@ -1124,11 +1160,25 @@ def build_inner_cap_adj_lite(transaction,
             inner_scale
         )
 
+        prev_segment_index = (i - 1) % count
+        next_segment_index = i
+
+        touches_inner_miter = (
+            segment_is_inner_miter[prev_segment_index] or
+            segment_is_inner_miter[next_segment_index]
+        )
+
+        if touches_inner_miter:
+            inner_point = bxm.lerp(
+                inner_point,
+                center,
+                inner_miter_pull
+            )
+
         inner_id = transaction.add_generated_vertex(inner_point)
         inner_ids.append(inner_id)
 
     created_faces = []
-    count = len(sorted_outer_ids)
     
     # 1. Build quad ring.
     for i in range(count):
@@ -1166,27 +1216,10 @@ def build_inner_cap_adj_lite(transaction,
             ))
             continue
 
-        orig_a = get_transaction_vertex_original_id(transaction, outer_a)
-        orig_b = get_transaction_vertex_original_id(transaction, outer_b)
-
-        print("[BevelX] ADJ_LITE segment inspect: outer=({0},{1}) orig=({2},{3})".format(
-            outer_a,
-            outer_b,
-            orig_a,
-            orig_b
-        ))
-
         face_kind = FACE_PATCH
 
-        if bevel_vertices is not None and vertex_boundaries is not None:
-            if should_use_inner_miter_patch_for_outer_pair(
-                transaction=transaction,
-                outer_a_id=outer_a,
-                outer_b_id=outer_b,
-                bevel_vertices=bevel_vertices,
-                vertex_boundaries=vertex_boundaries
-            ):
-                face_kind = FACE_INNER_MITER_PATCH
+        if segment_is_inner_miter[i]:
+            face_kind = FACE_INNER_MITER_PATCH
 
         patch_face = transaction.add_face(
             vertex_ids=[outer_a, outer_b, inner_b, inner_a],
@@ -1453,6 +1486,177 @@ def calculate_transaction_polygon_center(transaction, vertex_ids):
 # -----------------------------------------------------------------------------
 # F_VERT faces
 # -----------------------------------------------------------------------------
+
+def transaction_points_are_close(point_a, point_b, epsilon=1.0e-6):
+    """
+    Return True if two world-space points are nearly identical.
+    """
+
+    return bxm.length(
+        bxm.sub(point_a, point_b)
+    ) <= epsilon
+
+
+def collapse_transaction_ids_by_position(transaction,
+                                         tx_ids,
+                                         epsilon=1.0e-6):
+    """
+    Collapse repeated/coincident transaction vertices while preserving order.
+
+    This is important for CHAIN_2 inner miter caps:
+        4 boundary verts often collapse to 3 unique positions,
+        producing exactly the missing triangle.
+    """
+
+    collapsed = []
+
+    for tx_id in tx_ids:
+        point = transaction.vertices[tx_id].co_world
+
+        already_exists = False
+
+        for existing_tx_id in collapsed:
+            existing_point = transaction.vertices[existing_tx_id].co_world
+
+            if transaction_points_are_close(
+                point,
+                existing_point,
+                epsilon=epsilon
+            ):
+                already_exists = True
+                break
+
+        if not already_exists:
+            collapsed.append(tx_id)
+
+    return collapsed
+
+
+def add_local_inner_miter_face(transaction,
+                               tx_ids,
+                               source_vertex_id=None):
+    """
+    Add a local CHAIN_2 inner miter face.
+
+    Current expected case:
+        4 boundary verts -> 3 unique positions -> one triangle.
+
+    If there are 4 unique positions, add a small quad for now.
+    This keeps topology stable and avoids putting triangles on the
+    central ADJ-lite cap ring.
+    """
+
+    unique_tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=tx_ids
+    )
+    # Current CHAIN_2 local cap winding is flipped.
+    # Reverse winding while preserving the first vertex as anchor.
+    if len(unique_tx_ids) >= 3:
+        unique_tx_ids = [unique_tx_ids[0]] + list(reversed(unique_tx_ids[1:]))
+
+    if len(unique_tx_ids) < 3:
+        print("[BevelX] INNER_MITER vertex cap skipped for vertex {0}: fewer than 3 unique points, verts={1}".format(
+            source_vertex_id,
+            tx_ids
+        ))
+        return []
+
+    if is_degenerate_transaction_polygon(
+        transaction=transaction,
+        vertex_ids=unique_tx_ids
+    ):
+        print("[BevelX] INNER_MITER vertex cap skipped degenerate for vertex {0}: verts={1}".format(
+            source_vertex_id,
+            unique_tx_ids
+        ))
+        return []
+
+    points = [
+        transaction.vertices[tx_id].co_world
+        for tx_id in unique_tx_ids
+    ]
+
+    expected_normal = calculate_polygon_normal(points)
+
+    face = transaction.add_face(
+        vertex_ids=unique_tx_ids,
+        face_kind=FACE_INNER_MITER_PATCH,
+        source_face_id=None,
+        source_edge_id=None,
+        expected_normal=expected_normal
+    )
+
+    print("[BevelX] INNER_MITER vertex cap built for vertex {0}: verts={1}".format(
+        source_vertex_id,
+        unique_tx_ids
+    ))
+
+    return [face]
+
+
+def build_inner_miter_vertex_cap_faces(transaction,
+                                       bevel_vertices,
+                                       vertex_boundaries):
+    """
+    Build missing CHAIN_2 inner miter vertex-cap faces.
+
+    These are NOT central cap ring faces.
+
+    They fill the small triangular holes at CHAIN_2 vertices, between:
+        - the two selected-edge bevel strips
+        - the surrounding support/reconstructed faces
+        - the central cap boundary
+
+    Candidate rule:
+        - exactly 2 selected/beveled edges
+        - exactly 4 boundary vertices
+
+    In the current orthogonal case, the 4 boundaries collapse to 3
+    unique positions, producing the missing triangle.
+    """
+
+    created_faces = []
+
+    if bevel_vertices is None:
+        print("[BevelX] INNER_MITER vertex caps skipped: bevel_vertices is None.")
+        return created_faces
+
+    if vertex_boundaries is None:
+        print("[BevelX] INNER_MITER vertex caps skipped: vertex_boundaries is None.")
+        return created_faces
+
+    for vertex_id in sorted(vertex_boundaries.keys()):
+        if not is_inner_miter_candidate_vertex_id(
+            vertex_id=vertex_id,
+            bevel_vertices=bevel_vertices,
+            vertex_boundaries=vertex_boundaries
+        ):
+            continue
+
+        boundary_list = vertex_boundaries.get(vertex_id, [])
+
+        if len(boundary_list) != 4:
+            print("[BevelX] INNER_MITER vertex cap skipped for vertex {0}: expected 4 boundaries, got {1}.".format(
+                vertex_id,
+                len(boundary_list)
+            ))
+            continue
+
+        tx_ids = [
+            transaction.add_boundary_vertex(boundary_vertex)
+            for boundary_vertex in boundary_list
+        ]
+
+        faces = add_local_inner_miter_face(
+            transaction=transaction,
+            tx_ids=tx_ids,
+            source_vertex_id=vertex_id
+        )
+
+        created_faces.extend(faces)
+
+    return created_faces
 
 def build_vertex_cap_faces(transaction, vertex_boundaries):
     """
