@@ -1,5 +1,4 @@
 # BX_core.py
-# Public backend API for BevelX.
 from __future__ import print_function
 
 import maya.cmds as cmds
@@ -13,11 +12,12 @@ from BX_build import BX_rebuild
 from BX_math import BX_offset
 from BX_profile import BX_debug
 from BX_boundary import BX_boundary
+from BX_profile import BX_log
 
 
 
-def log(message):
-    print("[BevelX] {0}".format(message))
+def log(message, level="INFO", channel="summary"):
+    BX_log.log(message, level=level, channel=channel)
 
 def restore_selection(selection):
     """
@@ -34,7 +34,10 @@ def restore_selection(selection):
         else:
             cmds.select(clear=True)
     except Exception as exc:
-        log("Could not restore selection: {0}".format(exc))
+        BX_log.warn(
+            "Could not restore selection: {0}".format(exc),
+            channel="summary"
+        )
 
 def preview(settings=None):
     """
@@ -53,36 +56,36 @@ def preview(settings=None):
     if settings is None:
         settings = BX_settings.copy_defaults()
 
+    BX_log.configure(settings)
+
     original_selection = cmds.ls(selection=True, flatten=True) or []
 
     try:
-        log("Preview requested.")
-        log_settings(settings)
+        log("Preview requested.", channel="summary")
+        log_settings(settings, label="Preview settings")
 
         session = BX_session.start_or_rebuild_session(
             settings=settings,
             rail_builder=build_preview_offset_rails
         )
-
-        session.debug_print()
+        if BX_log.is_enabled("DEBUG", "transaction"):
+            session.debug_print()
 
         if session.last_error:
             log(session.last_error)
+            if not session.edges_data:
+                return settings
+            log("Preview is continuing in diagnostic mode.")
 
-            if session.last_error:
-                log(session.last_error)
-                if not session.edges_data:
-                    return settings
-                log("Preview is continuing in diagnostic mode.")
-
-        if session.bm:
+        if session.bm and BX_log.is_enabled("DEBUG", "topology"):
             session.bm.debug_print_summary()
             session.bm.debug_print_selected_edges()
 
-        if session.bevel_vertices:
+        if session.bevel_vertices and BX_log.is_enabled("DEBUG", "selection"):
             from BX_mesh import BX_bevelVertex
 
             BX_bevelVertex.debug_print_bevel_vertices(session.bevel_vertices)
+
             if session.bm:
                 BX_boundary.debug_print_bevel_vertex_topology_classification(
                     session.bm,
@@ -97,29 +100,7 @@ def preview(settings=None):
             edge_id = edge_data["edge_id"]
 
             log_edge_data(edge_data)
-
-            rails = session.rails_by_edge_id.get(edge_id, [])
             vertex_boundaries = session.boundaries_by_edge_id.get(edge_id, {})
-
-            for rail_data in rails:
-                rail = rail_data["rail"]
-
-                log("  Rail for face {0}: {1} -> {2}".format(
-                    rail_data["face_id"],
-                    rail[0],
-                    rail[1]
-                ))
-
-                if "side" in rail_data:
-                    log("    Chosen side: {0}, score: {1}".format(
-                        rail_data["side"],
-                        rail_data.get("score")
-                    ))
-
-                if "center" in rail_data:
-                    log("    Face center: {0}".format(
-                        rail_data["center"]
-                    ))
 
             if not printed_boundaries:
                 BX_boundary.debug_print_boundaries(vertex_boundaries)
@@ -138,19 +119,16 @@ def preview(settings=None):
 def apply(settings=None):
     """
     Apply BevelX result.
-
-    Current milestone:
-        - one selected manifold edge
-        - transaction-driven local edit
-        - uses current session if available
-        - otherwise builds a session first
     """
 
     if settings is None:
         settings = BX_settings.copy_defaults()
 
-    log("Apply requested.")
-    log_settings(settings)
+    BX_log.configure(settings)
+
+    log("Apply requested.", channel="summary")
+    BX_session.clear_session()
+    log_settings(settings, label="Apply settings")
 
     session = BX_session.get_current_session()
 
@@ -159,8 +137,8 @@ def apply(settings=None):
             settings=settings,
             rail_builder=build_preview_offset_rails
         )
-
-    session.debug_print()
+    if BX_log.is_enabled("DEBUG", "transaction"):
+        session.debug_print()
 
     if session.last_error:
         log("Apply blocked: {0}".format(session.last_error))
@@ -175,8 +153,11 @@ def apply(settings=None):
     if not transaction.faces:
         log("Apply failed: transaction has no faces.")
         return settings
-
-    transaction.debug_print()
+    if (
+        BX_log.is_enabled("DEBUG", "transaction") or
+        BX_log.is_enabled("DEBUG", "transaction_dump")
+    ):
+        transaction.debug_print()
 
     result = BX_build.apply_transaction_local_edit(
         bm=session.bm,
@@ -250,19 +231,11 @@ def build_preview_offset_rails(edge_data, settings):
             "score": rail_result["score"],
             "rail": rail,
         })
-
-        log("  Rail for face {0}: {1} -> {2}".format(
-            face_data["face_id"],
-            rail[0],
-            rail[1]
-        ))
-
-        log("    Chosen side: {0}, score: {1}".format(
-            rail_result["side"],
-            rail_result["score"]
-        ))
-
-        log("    Face center: {0}".format(face_center))
+        BX_log.trace("Rail for face {0}: {1} -> {2}".format(
+            face_data["face_id"], rail[0], rail[1]), channel="rails")
+        BX_log.trace("  Chosen side: {0}, score: {1}".format(
+            rail_result["side"], rail_result["score"]), channel="rails")
+        BX_log.trace("  Face center: {0}".format(face_center),channel="rails")
 
     return rails
 
@@ -303,8 +276,13 @@ def draw_session_preview(session, settings):
             BX_debug.draw_boundary_vertices(vertex_boundaries)
             drawn_boundaries = True
 
-    if session.selection_transaction is not None:
-        BX_debug.draw_transaction_faces(session.selection_transaction)
+    if (session.selection_transaction is not None and
+        (
+            BX_log.is_enabled("DEBUG", "transaction") or
+            BX_log.is_enabled("DEBUG", "transaction_dump")
+        )
+    ):
+        session.selection_transaction.debug_print()
 
 def update_preview(settings=None):
     """
@@ -316,18 +294,20 @@ def update_preview(settings=None):
     if settings is None:
         settings = BX_settings.copy_defaults()
 
+    BX_log.configure(settings)
+
     original_selection = cmds.ls(selection=True, flatten=True) or []
 
     try:
         log("Update preview requested.")
-        log_settings(settings)
+        log_settings(settings, label="Update preview settings")
 
         session = BX_session.rebuild_session(
             settings=settings,
             rail_builder=build_preview_offset_rails
         )
-
-        session.debug_print()
+        if BX_log.is_enabled("DEBUG", "transaction"):
+            session.debug_print()
 
         if session.last_error:
             log(session.last_error)
@@ -340,23 +320,47 @@ def update_preview(settings=None):
     finally:
         restore_selection(original_selection)
 
-def log_settings(settings):
-    for key in sorted(settings.keys()):
-        log("  {0}: {1}".format(key, settings[key]))
+def log_settings(settings, label="Settings"):
+    BX_log.configure(settings)
+
+    if not BX_log.is_enabled("INFO", "settings"):
+        return
+
+    BX_log.info("{0}:".format(label), channel="settings")
+
+    compact_keys = [
+        "affect",
+        "width_type",
+        "width",
+        "segments",
+        "profile_type",
+        "profile_shape",
+        "miter_outer",
+        "miter_inner",
+        "inner_cap_mode",
+        "pole_cap_mode",
+    ]
+
+    for key in compact_keys:
+        if key in settings:
+            BX_log.info("  {0}: {1}".format(key, settings[key]), channel="settings")
 
 
 def log_edge_data(edge_data):
-    log("Edge: {0}".format(edge_data["component"]))
-    log("  Mesh node: {0}".format(edge_data["node"]))
-    log("  Shape: {0}".format(edge_data["shape"]))
-    log("  Edge ID: {0}".format(edge_data["edge_id"]))
-    log("  Vertex IDs: {0}".format(edge_data["vertex_ids"]))
-    log("  Vertex positions:")
-    log("    A: {0}".format(edge_data["vertex_positions"][0]))
-    log("    B: {0}".format(edge_data["vertex_positions"][1]))
-    log("  Connected faces: {0}".format(len(edge_data["faces"])))
+    if not BX_log.is_enabled("DEBUG", "selection"):
+        return
+
+    BX_log.debug("Edge: {0}".format(edge_data["component"]), channel="selection")
+    BX_log.debug("  Mesh node: {0}".format(edge_data["node"]), channel="selection")
+    BX_log.debug("  Shape: {0}".format(edge_data["shape"]), channel="selection")
+    BX_log.debug("  Edge ID: {0}".format(edge_data["edge_id"]), channel="selection")
+    BX_log.debug("  Vertex IDs: {0}".format(edge_data["vertex_ids"]), channel="selection")
+    BX_log.debug("  Vertex positions:", channel="selection")
+    BX_log.debug("    A: {0}".format(edge_data["vertex_positions"][0]), channel="selection")
+    BX_log.debug("    B: {0}".format(edge_data["vertex_positions"][1]), channel="selection")
+    BX_log.debug("  Connected faces: {0}".format(len(edge_data["faces"])), channel="selection")
 
     for face_data in edge_data["faces"]:
-        log("    Face: {0}".format(face_data["component"]))
-        log("      Face ID: {0}".format(face_data["face_id"]))
-        log("      Normal: {0}".format(face_data["normal"]))
+        BX_log.trace("    Face: {0}".format(face_data["component"]), channel="selection")
+        BX_log.trace("      Face ID: {0}".format(face_data["face_id"]), channel="selection")
+        BX_log.trace("      Normal: {0}".format(face_data["normal"]), channel="selection")

@@ -1,11 +1,4 @@
 # BX_build.py
-# BevelX geometry application layer.
-#
-# Current milestone:
-# - Apply BX_BevelTransaction to the current Maya mesh.
-# - Local edit, not full mesh replacement.
-# - One selected manifold edge supported.
-# - Segments = 1 supported.
 
 from __future__ import print_function
 
@@ -13,6 +6,7 @@ import maya.cmds as cmds
 import maya.api.OpenMaya as om
 
 from BX_build import BX_rebuild
+from BX_profile import BX_log
 # -----------------------------------------------------------------------------
 # Maya mesh extraction
 # -----------------------------------------------------------------------------
@@ -126,7 +120,7 @@ def apply_transaction_local_edit(bm, transaction, settings=None):
 
         cmds.select(source_node, replace=True)
 
-        print("[BevelX] Transaction local edit applied to: {0}".format(source_node))
+        BX_log.info("Transaction local edit applied to: {0}".format(source_node), channel="summary")
 
         print_post_apply_topology(source_node)
 
@@ -144,40 +138,35 @@ def print_post_apply_topology(source_node):
         vertex_count = cmds.polyEvaluate(source_node, vertex=True)
         edge_count = cmds.polyEvaluate(source_node, edge=True)
         face_count = cmds.polyEvaluate(source_node, face=True)
-
-        print("[BevelX] Mesh after transaction:")
-        print("[BevelX]   vertices: {0}".format(vertex_count))
-        print("[BevelX]   edges: {0}".format(edge_count))
-        print("[BevelX]   faces: {0}".format(face_count))
-        print_unused_vertices(source_node=source_node)
+        unused_vertices = get_unused_vertices(source_node)
+        BX_log.info("Mesh after transaction: vertices={0}, edges={1}, faces={2}, unused={3}".format(
+            vertex_count,
+            edge_count,
+            face_count,
+            unused_vertices
+        ), channel="topology")
     except Exception as exc:
         print("[BevelX] Could not evaluate post-apply topology: {0}".format(exc))
 
-def print_unused_vertices(source_node):
+def get_unused_vertices(source_node):
     """
-    Debug helper to print isolated / unused vertices.
+    Debug helper to get isolated / unused vertices.
     """
+    vertex_count = cmds.polyEvaluate(source_node, vertex=True)
+    unused = []
 
-    try:
-        vertex_count = cmds.polyEvaluate(source_node, vertex=True)
-        unused = []
+    for vertex_id in range(vertex_count):
+        connected_edges = cmds.polyListComponentConversion(
+            "{0}.vtx[{1}]".format(source_node, vertex_id),
+            fromVertex=True,
+            toEdge=True
+        ) or []
 
-        for vertex_id in range(vertex_count):
-            connected_edges = cmds.polyListComponentConversion(
-                "{0}.vtx[{1}]".format(source_node, vertex_id),
-                fromVertex=True,
-                toEdge=True
-            ) or []
+        connected_edges = cmds.ls(connected_edges, flatten=True) or []
 
-            connected_edges = cmds.ls(connected_edges, flatten=True) or []
-
-            if not connected_edges:
-                unused.append(vertex_id)
-
-        print("[BevelX]   unused vertices: {0}".format(unused))
-
-    except Exception as exc:
-        print("[BevelX] Could not inspect unused vertices: {0}".format(exc))
+        if not connected_edges:
+            unused.append(vertex_id)
+    return unused
 
 def get_transaction_faces_in_apply_order(transaction):
     """
@@ -258,7 +247,10 @@ def append_transaction_face(source_node,
     for tx_vertex_id, maya_vertex_id in zip(new_tx_vertex_ids, new_maya_vertex_ids):
         tx_to_maya_vertex[tx_vertex_id] = maya_vertex_id
 
-    print("[BevelX]   Appended {0}: {1}".format(face.face_kind, face.vertex_ids))
+    BX_log.trace(
+        "Appended {0}: {1}".format(face.face_kind, face.vertex_ids),
+        channel="append"
+    )
 
 
 def append_face_and_return_new_vertices(source_node, append_items):

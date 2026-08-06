@@ -17,6 +17,8 @@ import re
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 
+from BX_profile import BX_log
+
 
 EDGE_RE = re.compile(r"^(?P<node>.+)\.e\[(?P<index>\d+)\]$")
 VERT_RE = re.compile(r"^(?P<node>.+)\.vtx\[(?P<index>\d+)\]$")
@@ -312,37 +314,59 @@ def get_selected_edges_data():
         for edge_component in edge_components
     ]
 
-
 def print_selected_edges_debug():
     """
     Convenience manual test.
     Run with polygon edges selected.
-    """
 
+    Logging:
+        - summary count at DEBUG / selection
+        - edge-level data at DEBUG / selection
+        - face-level data at TRACE / selection
+    """
     edges_data = get_selected_edges_data()
 
+    if not BX_log.is_enabled("DEBUG", "selection"):
+        return edges_data
+
     if not edges_data:
-        print("[BevelX] No selected polygon edges.")
+        BX_log.debug("No selected polygon edges.",
+            channel="selection")
         return []
 
-    print("[BevelX] Selected edge count: {0}".format(len(edges_data)))
+    BX_log.debug("Selected edge count: {0}".format(len(edges_data)),
+        channel="selection")
 
     for edge_data in edges_data:
-        print("[BevelX] Edge: {0}".format(edge_data["component"]))
-        print("[BevelX]   Mesh node: {0}".format(edge_data["node"]))
-        print("[BevelX]   Shape: {0}".format(edge_data["shape"]))
-        print("[BevelX]   Edge ID: {0}".format(edge_data["edge_id"]))
-        print("[BevelX]   Vertex IDs: {0}".format(edge_data["vertex_ids"]))
-        print("[BevelX]   Vertex positions:")
-        print("[BevelX]     {0}".format(edge_data["vertex_positions"][0]))
-        print("[BevelX]     {0}".format(edge_data["vertex_positions"][1]))
-        print("[BevelX]   Connected faces: {0}".format(len(edge_data["faces"])))
+        BX_log.debug("Edge: {0}".format(edge_data["component"]),
+            channel="selection")
+        BX_log.debug("  Mesh node: {0}".format(edge_data["node"]),
+            channel="selection")
+        BX_log.debug("  Shape: {0}".format(edge_data["shape"]),
+            channel="selection")
+        BX_log.debug("  Edge ID: {0}".format(edge_data["edge_id"]),
+            channel="selection")
+        BX_log.debug("  Vertex IDs: {0}".format(edge_data["vertex_ids"]),
+            channel="selection")
+        BX_log.debug("  Vertex positions:",
+            channel="selection")
+        BX_log.debug("    {0}".format(edge_data["vertex_positions"][0]),
+            channel="selection")
+        BX_log.debug("    {0}".format(edge_data["vertex_positions"][1]),
+            channel="selection")
+        BX_log.debug("  Connected faces: {0}".format(len(edge_data["faces"])),
+            channel="selection")
 
         for face_data in edge_data["faces"]:
-            print("[BevelX]     Face: {0}".format(face_data["component"]))
-            print("[BevelX]       Face ID: {0}".format(face_data["face_id"]))
-            print("[BevelX]       Normal: {0}".format(face_data["normal"]))
-
+            BX_log.trace("    Face: {0}".format(face_data["component"]),
+                channel="selection")
+            BX_log.trace("      Face ID: {0}".format(face_data["face_id"]),
+                channel="selection")
+            BX_log.trace("      Normal: {0}".format(face_data["normal"]),
+                channel="selection")
+            if "center" in face_data:
+                BX_log.trace("      Center: {0}".format(face_data["center"]),
+                    channel="selection")
     return edges_data
 
 def get_face_world_center(node, face_id):

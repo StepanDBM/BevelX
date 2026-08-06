@@ -16,9 +16,12 @@ import importlib
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(PACKAGE_DIR)
 
+from BX_profile import BX_log
+
 MODULES_TO_RELOAD = [
     # Core
     "BX_core.BX_settings",
+    "BX_profile.BX_log",
     "BX_core.BX_context",
     "BX_core.BX_session",
     # Math / solver foundation
@@ -43,6 +46,7 @@ MODULES_TO_RELOAD = [
     "BX_build.BX_rebuild",
     # Output / production systems
     "BX_profile.BX_debug",
+    "BX_profile.BX_audit",
     "BX_profile.BX_profile",
     "BX_profile.BX_normals",
     "BX_profile.BX_attributes",
@@ -51,20 +55,27 @@ MODULES_TO_RELOAD = [
     # Backend entry point
     "BX_core.BX_core",
     # Root UI
-    "BX_UI",
+    "BX_UI"
 ]
 def ensure_path():
     for path in (PACKAGE_DIR, PARENT_DIR):
         if path and path not in sys.path:
             sys.path.insert(0, path)
-            print("[BevelX] Added to sys.path: {0}".format(path))
+            try:
+                from BX_profile import BX_log
+                BX_log.debug("Added to sys.path: {0}".format(path), channel="reload")
+            except Exception:
+                pass
 
 
 def reload_module(module_name):
     try:
         module = importlib.import_module(module_name)
         importlib.reload(module)
-        print("[BevelX] Reloaded: {0}".format(module_name))
+        try:
+            BX_log.debug("Reloaded: {0}".format(module_name), channel="reload")
+        except Exception:
+            pass
         return module
 
     except Exception as exc:

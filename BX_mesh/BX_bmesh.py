@@ -20,6 +20,8 @@ from __future__ import print_function
 import maya.cmds as cmds
 import maya.api.OpenMaya as om
 
+from BX_profile import BX_log
+
 
 # -----------------------------------------------------------------------------
 # Topology elements
@@ -394,46 +396,45 @@ class BX_BMesh(object):
     # -------------------------------------------------------------------------
 
     def debug_print_summary(self):
-        print("[BevelX] BX_BMesh summary:")
-        print("[BevelX]   Node: {0}".format(self.node))
-        print("[BevelX]   Shape: {0}".format(self.shape))
-        print("[BevelX]   Vertices: {0}".format(len(self.vertices)))
-        print("[BevelX]   Edges: {0}".format(len(self.edges)))
-        print("[BevelX]   Faces: {0}".format(len(self.faces)))
-        print("[BevelX]   Loops: {0}".format(len(self.loops)))
-        print("[BevelX]   Selected edges: {0}".format(self.selected_edges))
-        print("[BevelX]   Selected vertices: {0}".format(self.selected_vertices))
-        print("[BevelX]   Selected faces: {0}".format(self.selected_faces))
+        """
+        Log BMesh summary diagnostics.
+        """
+        if not BX_log.is_enabled("DEBUG", "topology"):
+            return
+
+        BX_log.debug("BX_BMesh summary:", channel="topology")
+        BX_log.debug("  Node: {0}".format(self.node), channel="topology")
+        BX_log.debug("  Shape: {0}".format(self.shape), channel="topology")
+        BX_log.debug("  Vertices: {0}".format(len(self.vertices)), channel="topology")
+        BX_log.debug("  Edges: {0}".format(len(self.edges)), channel="topology")
+        BX_log.debug("  Faces: {0}".format(len(self.faces)), channel="topology")
+        BX_log.debug("  Loops: {0}".format(len(self.loops)), channel="topology")
+        BX_log.debug("  Selected edges: {0}".format(self.selected_edges), channel="topology")
+        BX_log.debug("  Selected vertices: {0}".format(self.selected_vertices), channel="topology")
+        BX_log.debug("  Selected faces: {0}".format(self.selected_faces), channel="topology")
 
     def debug_print_selected_edges(self):
-        print("[BevelX] Selected edge topology:")
-
+        """
+        Log selected edge topology diagnostics.
+        """
+        if not BX_log.is_enabled("DEBUG", "topology"):
+            return
+        BX_log.debug("Selected edge topology:", channel="topology")
         for edge_id in self.selected_edges:
             edge = self.edges[edge_id]
 
-            print("[BevelX]   Edge {0}: {1} -> {2}".format(
-                edge.id,
-                edge.v0,
-                edge.v1
-            ))
-
-            print("[BevelX]     Faces: {0}".format(edge.faces))
-
-            print("[BevelX]     V0 connected edges: {0}".format(
-                self.vertices[edge.v0].edges
-            ))
-
-            print("[BevelX]     V1 connected edges: {0}".format(
-                self.vertices[edge.v1].edges
-            ))
-
-            print("[BevelX]     V0 faces: {0}".format(
-                self.vertices[edge.v0].faces
-            ))
-
-            print("[BevelX]     V1 faces: {0}".format(
-                self.vertices[edge.v1].faces
-            ))
+            BX_log.debug("  Edge {0}: {1} -> {2}".format(
+                    edge.id, edge.v0, edge.v1), channel="topology")
+            BX_log.debug("    Faces: {0}".format(edge.faces),
+                         channel="topology")
+            BX_log.trace("    V0 connected edges: {0}".format(
+                    self.vertices[edge.v0].edges), channel="topology")
+            BX_log.trace("    V1 connected edges: {0}".format(
+                    self.vertices[edge.v1].edges), channel="topology")
+            BX_log.trace("    V0 faces: {0}".format(
+                    self.vertices[edge.v0].faces), channel="topology")
+            BX_log.trace("    V1 faces: {0}".format(
+                self.vertices[edge.v1].faces),channel="topology")
 
 
 # -----------------------------------------------------------------------------

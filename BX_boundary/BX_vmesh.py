@@ -1,18 +1,9 @@
 # BX_vmesh.py
-# BevelX simple vertex-mesh / corner cap builders.
-#
-# Current milestone:
-#   - M_TRI_CAP for selected_count == 3
-#   - segments = 1
-#   - cube-like / manifold corner
-#
-# This is the first real equivalent of Blender-style VMesh/corner handling.
-# It is intentionally small:
-#   selected_count == 3 -> three cap boundary points -> F_VERT triangle later.
 
 from __future__ import print_function
 
 from BX_math import BX_math as bxm
+from BX_profile import BX_log
 
 
 def build_corner_3_tri_cap_boundary_for_vertex(bm,
@@ -68,10 +59,8 @@ def build_corner_3_tri_cap_boundary_for_vertex(bm,
     selected_edge_ids = list(bevel_vertex.selected_edges)
 
     if len(selected_edge_ids) != 3:
-        print("[BevelX] TRI_CAP failed at vertex {0}: expected 3 selected edges, got {1}.".format(
-            vertex_id,
-            len(selected_edge_ids)
-        ))
+        BX_log.warn("TRI_CAP failed at vertex {0}: expected 3 selected edges, got {1}.".format(
+                vertex_id, len(selected_edge_ids)), channel="caps")
         return []
 
     cap_face_ids = get_cap_faces_for_three_edges(
@@ -81,11 +70,8 @@ def build_corner_3_tri_cap_boundary_for_vertex(bm,
     )
 
     if len(cap_face_ids) != 3:
-        print("[BevelX] TRI_CAP failed at vertex {0}: expected 3 cap faces, got {1}: {2}".format(
-            vertex_id,
-            len(cap_face_ids),
-            cap_face_ids
-        ))
+        BX_log.warn("TRI_CAP failed at vertex {0}: expected 3 cap faces, got {1}: {2}".format(
+                vertex_id, len(cap_face_ids), cap_face_ids), channel="caps")
         return []
 
     boundary_vertices = []
@@ -98,11 +84,8 @@ def build_corner_3_tri_cap_boundary_for_vertex(bm,
         )
 
         if len(edge_ids_for_face) != 2:
-            print("[BevelX] TRI_CAP failed at vertex {0}: face {1} has selected edges {2}.".format(
-                vertex_id,
-                face_id,
-                edge_ids_for_face
-            ))
+            BX_log.warn("TRI_CAP failed at vertex {0}: face {1} has selected edges {2}.".format(
+                    vertex_id, face_id, edge_ids_for_face), channel="caps")
             return []
 
         edge_a_id = edge_ids_for_face[0]
@@ -119,10 +102,8 @@ def build_corner_3_tri_cap_boundary_for_vertex(bm,
         )
 
         if rail_a is None or rail_b is None:
-            print("[BevelX] TRI_CAP failed at vertex {0}: missing rail for face {1}.".format(
-                vertex_id,
-                face_id
-            ))
+            BX_log.warn("TRI_CAP failed at vertex {0}: missing rail for face {1}.".format(
+                    vertex_id, face_id), channel="caps")
             return []
 
         point = bxm.line_line_intersection_midpoint(
@@ -202,7 +183,6 @@ def get_rail_for_face(rails, face_id):
 
     return None
 
-
 def orient_tri_cap_boundaries(bm, boundary_vertices, vertex_id):
     """
     Return tri-cap boundary vertices in an orientation roughly matching
@@ -255,3 +235,154 @@ def average_face_normal_for_boundaries(bm, boundary_vertices):
         normal = bxm.add(normal, face_normal)
 
     return bxm.normalize(normal)
+
+def build_pole_n_boundary_for_vertex(bm,
+                                     bevel_vertex,
+                                     edge_data_by_id,
+                                     rails_by_edge_id,
+                                     boundary_class,
+                                     link_function):
+    """
+    Build a first simple POLE_N boundary for selected_count >= 4.
+
+    First target:
+        - segments == 1
+        - all selected edges around the pole are adjacent in the edge ring
+        - one boundary vertex per face sector between consecutive selected edges
+
+    This gives the transaction layer a clean ordered boundary ring that can be
+    turned into one F_VERT polygon.
+    """
+
+    vertex_id = bevel_vertex.vertex_id
+    selected_edges = list(bevel_vertex.selected_edges)
+    selected_edge_set = set(selected_edges)
+    edge_halves = list(getattr(bevel_vertex, "edge_halves", []))
+
+    if len(selected_edges) < 4:
+        return []
+
+    if not edge_halves:
+        BX_log.warn("POLE_N skipped at vertex {0}: missing edge_half order.".format(
+                vertex_id), channel="caps")
+        return []
+
+    ordered_selected_halves = []
+
+    for edge_half in edge_halves:
+        if edge_half.edge_id in selected_edge_set:
+            ordered_selected_halves.append(edge_half)
+        else:
+            # First simple pole version: all edges around the pole must be selected.
+            BX_log.debug("POLE_N skipped at vertex {0}: found unselected incident edge {1}.".format(
+                    vertex_id, edge_half.edge_id), channel="caps")
+            return []
+
+    if len(ordered_selected_halves) != len(edge_halves):
+        BX_log.debug("POLE_N skipped at vertex {0}: selected/incident mismatch.".format(
+                vertex_id), channel="caps")
+        return []
+
+    boundary_list = []
+    count = len(ordered_selected_halves)
+
+    for i in range(count):
+        prev_half = ordered_selected_halves[(i - 1) % count]
+        current_half = ordered_selected_halves[i]
+
+        prev_edge_id = prev_half.edge_id
+        current_edge_id = current_half.edge_id
+
+        prev_edge = bm.edges[prev_edge_id]
+        current_edge = bm.edges[current_edge_id]
+
+        common_faces = sorted(list(set(prev_edge.faces).intersection(set(current_edge.faces))))
+
+        if not common_faces:
+            BX_log.warn("POLE_N skipped at vertex {0}: edges {1}, {2} share no face.".format(
+                    vertex_id, prev_edge_id, current_edge_id), channel="caps")
+            return []
+
+        face_id = common_faces[0]
+
+        # Existing get_rail_for_face() returns the rail tuple itself:
+        #     (rail_p0, rail_p1)
+        # not the rail_data dictionary.
+        prev_rail = get_rail_for_face(
+            rails=rails_by_edge_id.get(prev_edge_id, []),
+            face_id=face_id
+        )
+
+        current_rail = get_rail_for_face(
+            rails=rails_by_edge_id.get(current_edge_id, []),
+            face_id=face_id
+        )
+
+        if prev_rail is None or current_rail is None:
+            BX_log.warn("POLE_N skipped at vertex {0}: missing rails for face {1}.".format(
+                    vertex_id, face_id), channel="caps")
+            return []
+
+        prev_point = get_rail_endpoint_for_pole_vertex(
+            edge_data=edge_data_by_id.get(prev_edge_id),
+            rail=prev_rail,
+            vertex_id=vertex_id
+        )
+
+        current_point = get_rail_endpoint_for_pole_vertex(
+            edge_data=edge_data_by_id.get(current_edge_id),
+            rail=current_rail,
+            vertex_id=vertex_id
+        )
+
+        if prev_point is None or current_point is None:
+            BX_log.warn("POLE_N skipped at vertex {0}: missing rail endpoints on face {1}.".format(
+                    vertex_id, face_id), channel="caps")
+            return []
+
+        # First simple pole point: average the two offset rail endpoints on the shared face.
+        # This is stable for segments=1 and avoids introducing another intersection solver yet.
+        point = bxm.midpoint(prev_point, current_point)
+
+        boundary_vertex = boundary_class(
+            boundary_id="BV{0}_POLE_N_F{1}".format(vertex_id, face_id),
+            original_vertex_id=vertex_id,
+            selected_edge_id=current_edge_id,
+            face_id=face_id,
+            co_world=point,
+            source="POLE_N"
+        )
+
+        boundary_list.append(boundary_vertex)
+
+    link_function(boundary_list)
+
+    BX_log.debug("POLE_N boundary built for vertex {0}: count={1}".format(
+            vertex_id, len(boundary_list)), channel="caps")
+
+    return boundary_list
+
+
+def get_rail_endpoint_for_pole_vertex(edge_data, rail, vertex_id):
+    """
+    Return the endpoint of a rail tuple that corresponds to vertex_id.
+
+    rail is expected to be:
+        (rail_p0, rail_p1)
+
+    This matches BX_boundary.get_rail_for_face(), which returns rail_data["rail"].
+    """
+
+    if edge_data is None:
+        return None
+
+    edge_v0, edge_v1 = edge_data["vertex_ids"]
+    rail_p0, rail_p1 = rail
+
+    if vertex_id == edge_v0:
+        return rail_p0
+
+    if vertex_id == edge_v1:
+        return rail_p1
+
+    return None

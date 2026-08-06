@@ -1,14 +1,9 @@
 # BX_transaction.py
-# BevelX bevel transaction model.
-#
-# Current milestone:
-# - Build one F_EDGE bevel face from terminal boundary vertices.
-# - Build F_RECON faces for the two affected original faces.
-# - Pure data structure, no Maya editing.
 
 from __future__ import print_function
 
 from BX_math import BX_math as bxm
+from BX_profile import BX_log
 
 
 FACE_ORIG = "F_ORIG"
@@ -38,7 +33,11 @@ class BX_TransactionVertex(object):
                  original_vertex_id=None,
                  boundary_id=None,
                  selected_edge_id=None,
-                 face_id=None):
+                 face_id=None,
+                 edge_before_id=None,
+                 edge_after_id=None,
+                 edge_on_id=None,
+                 boundary_role=None):
         self.id = int(vertex_id)
 
         self.co_world = list(co_world)
@@ -50,10 +49,18 @@ class BX_TransactionVertex(object):
         self.selected_edge_id = selected_edge_id
         self.face_id = face_id
 
+        # Passive metadata only.
+        # Do not make reconstruction decisions from these yet.
+        self.edge_before_id = edge_before_id
+        self.edge_after_id = edge_after_id
+        self.edge_on_id = edge_on_id
+        self.boundary_role = boundary_role
+
     def __repr__(self):
         return (
             "BX_TransactionVertex(id={0}, source={1}, orig_v={2}, "
-            "boundary={3}, edge={4}, face={5}, co={6})"
+            "boundary={3}, edge={4}, face={5}, before={6}, after={7}, "
+            "on={8}, role={9}, co={10})"
         ).format(
             self.id,
             self.source,
@@ -61,6 +68,10 @@ class BX_TransactionVertex(object):
             self.boundary_id,
             self.selected_edge_id,
             self.face_id,
+            self.edge_before_id,
+            self.edge_after_id,
+            self.edge_on_id,
+            self.boundary_role,
             self.co_world
         )
 
@@ -106,6 +117,8 @@ class BX_BevelTransaction(object):
         self.boundary_id_to_tx_id = {}
 
         self.faces_to_replace = []
+
+        self.inner_miter_local_cap_keys = set()
 
     # -------------------------------------------------------------------------
     # Vertex creation
@@ -160,7 +173,11 @@ class BX_BevelTransaction(object):
             original_vertex_id=boundary_vertex.original_vertex_id,
             boundary_id=boundary_vertex.id,
             selected_edge_id=boundary_vertex.selected_edge_id,
-            face_id=boundary_vertex.face_id
+            face_id=boundary_vertex.face_id,
+            edge_before_id=getattr(boundary_vertex, "edge_before_id", None),
+            edge_after_id=getattr(boundary_vertex, "edge_after_id", None),
+            edge_on_id=getattr(boundary_vertex, "edge_on_id", None),
+            boundary_role=getattr(boundary_vertex, "boundary_role", None)
         )
 
         self.vertices.append(tx_vertex)
@@ -229,26 +246,79 @@ class BX_BevelTransaction(object):
     # -------------------------------------------------------------------------
 
     def debug_print(self):
-        print("[BevelX] BevelTransaction:")
-        print("[BevelX]   transaction vertices: {0}".format(len(self.vertices)))
-        print("[BevelX]   transaction faces: {0}".format(len(self.faces)))
-        print("[BevelX]   faces to replace: {0}".format(self.faces_to_replace))
+        if BX_log.is_enabled("DEBUG", "transaction_dump"):
+            BX_log.debug("BevelTransaction:", channel="transaction_dump")
+            BX_log.debug("  transaction vertices: {0}".format(len(self.vertices)), channel="transaction_dump")
+            BX_log.debug("  transaction faces: {0}".format(len(self.faces)), channel="transaction_dump")
+            BX_log.debug("  faces to replace: {0}".format(self.faces_to_replace), channel="transaction_dump")
 
-        print("[BevelX]   vertices:")
+            BX_log.debug("  vertices:", channel="transaction_dump")
+            for vertex in self.vertices:
+                BX_log.debug("    {0}".format(vertex), channel="transaction_dump")
 
+            BX_log.debug("  faces:", channel="transaction_dump")
+            for face in self.faces:
+                BX_log.debug("    {0}".format(face), channel="transaction_dump")
+
+            return
+
+        if BX_log.is_enabled("DEBUG", "transaction"):
+            BX_log.debug(
+                "BevelTransaction summary: vertices={0}, faces={1}, replace={2}".format(
+                    len(self.vertices),
+                    len(self.faces),
+                    len(self.faces_to_replace)
+                ),
+                channel="transaction"
+            )
+        BX_log.debug("BevelTransaction:", channel="transaction_dump")
+        BX_log.debug("  transaction vertices: {0}".format(len(self.vertices)), channel="transaction_dump")
+        BX_log.debug("  transaction faces: {0}".format(len(self.faces)), channel="transaction_dump")
+        BX_log.debug("  faces to replace: {0}".format(self.faces_to_replace), channel="transaction_dump")
+
+        BX_log.debug("  vertices:", channel="transaction_dump")
         for vertex in self.vertices:
-            print("[BevelX]     {0}".format(vertex))
+            BX_log.debug("    {0}".format(vertex), channel="transaction_dump")
 
-        print("[BevelX]   faces:")
-
+        BX_log.debug("  faces:", channel="transaction_dump")
         for face in self.faces:
-            print("[BevelX]     {0}".format(face))
+            BX_log.debug("    {0}".format(face), channel="transaction_dump")
 
 
 # -----------------------------------------------------------------------------
 # Transaction construction
 # -----------------------------------------------------------------------------
-def build_single_edge_transaction(edge_data, vertex_boundaries, bm=None):
+def transaction_has_terminal_multi_boundaries(vertex_boundaries):
+    """
+    Return True if any original vertex has TERMINAL_MULTI boundary data.
+    """
+
+    for boundary_list in vertex_boundaries.values():
+        for boundary_vertex in boundary_list:
+            if getattr(boundary_vertex, "source", None) == "TERMINAL_MULTI":
+                return True
+
+    return False
+
+
+def vertex_has_terminal_multi_boundaries(vertex_boundaries, vertex_id):
+    """
+    Return True if this original vertex has TERMINAL_MULTI boundary data.
+    """
+
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    for boundary_vertex in boundary_list:
+        if getattr(boundary_vertex, "source", None) == "TERMINAL_MULTI":
+            return True
+
+    return False
+
+def build_single_edge_transaction(edge_data,
+                                  vertex_boundaries,
+                                  bm=None,
+                                  bevel_vertices=None,
+                                  settings=None):
     """
     Build a BevelX transaction for one selected edge.
 
@@ -262,6 +332,20 @@ def build_single_edge_transaction(edge_data, vertex_boundaries, bm=None):
         old affected faces are replaced after new topology exists
     """
 
+    if transaction_has_terminal_multi_boundaries(vertex_boundaries):
+        BX_log.warn(
+            "Single-edge transaction using selection path because TERMINAL_MULTI boundaries exist.",
+            channel="summary"
+        )
+
+        return build_selection_transaction(
+            edges_data=[edge_data],
+            vertex_boundaries=vertex_boundaries,
+            bm=bm,
+            bevel_vertices=bevel_vertices,
+            settings=settings
+        )
+
     transaction = BX_BevelTransaction()
 
     edge_id = edge_data["edge_id"]
@@ -273,7 +357,8 @@ def build_single_edge_transaction(edge_data, vertex_boundaries, bm=None):
     ]
 
     if len(adjacent_face_ids) != 2:
-        print("[BevelX] Transaction build requires exactly 2 adjacent selected-edge faces.")
+        BX_log.warn("Transaction build requires exactly 2 adjacent selected-edge faces.",
+                    channel="transaction")
         return transaction
 
     build_edge_face(
@@ -285,7 +370,8 @@ def build_single_edge_transaction(edge_data, vertex_boundaries, bm=None):
     if bm is None:
         transaction.faces_to_replace = list(adjacent_face_ids)
 
-        print("[BevelX] Transaction warning: bm is None, only F_EDGE was built.")
+        BX_log.warn("Transaction warning: bm is None, only F_EDGE was built.",
+                    channel="transaction")
         return transaction
 
     affected_face_ids = get_affected_face_ids_for_single_edge(
@@ -305,38 +391,6 @@ def build_single_edge_transaction(edge_data, vertex_boundaries, bm=None):
             edge_v1=edge_v1,
             vertex_boundaries=vertex_boundaries
         )
-
-    return transaction
-
-def build_selection_edge_faces_transaction(edges_data, vertex_boundaries, bm=None):
-    """
-    Build a preview transaction for a multi-edge selection.
-
-    Current output:
-        - F_EDGE faces for every selected edge.
-        - Shared boundary vertices are reused through boundary_id mapping.
-        - faces_to_replace is collected for diagnostics.
-
-    This does NOT build F_RECON yet.
-    This transaction is preview-only for multi-edge selections.
-    """
-
-    transaction = BX_BevelTransaction()
-
-    for edge_data in edges_data:
-        build_edge_face(
-            transaction=transaction,
-            edge_data=edge_data,
-            vertex_boundaries=vertex_boundaries
-        )
-
-    if bm is not None:
-        affected_face_ids = get_affected_face_ids_for_selected_edges(
-            bm=bm,
-            edges_data=edges_data
-        )
-
-        transaction.faces_to_replace = affected_face_ids
 
     return transaction
 
@@ -404,7 +458,11 @@ def can_build_edge_face_from_boundaries(edge_data, vertex_boundaries):
 
     return None not in required
 
-def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_vertices=None):
+def build_selection_transaction(edges_data,
+                                vertex_boundaries,
+                                bm=None,
+                                bevel_vertices=None,
+                                settings=None):
     """
     Build a full preview/apply transaction for a selected edge set.
 
@@ -415,13 +473,14 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_ve
     """
 
     transaction = BX_BevelTransaction()
+    if settings is None:
+        settings = {}
 
     # Validate selected-edge strips first.
     for edge_data in edges_data:
         if not can_build_edge_face_from_boundaries(edge_data, vertex_boundaries):
-            print("[BevelX] Selection transaction skipped: missing boundary data for edge {0}.".format(
-                edge_data["edge_id"]
-            ))
+            BX_log.warn("Selection transaction skipped: missing boundary data for edge {0}.".format(
+                    edge_data["edge_id"]), channel="transaction")
             return transaction
 
     # 1. Build all selected-edge bevel strip faces.
@@ -435,15 +494,16 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_ve
     # 2. Build vertex cap faces.
     build_vertex_cap_faces(
         transaction=transaction,
-        vertex_boundaries=vertex_boundaries
+        vertex_boundaries=vertex_boundaries,
+        bm=bm
     )
-
-    # 2b. Build CHAIN_2 inner miter vertex caps.
-    # These are the missing local triangles, not central ADJ-lite ring splits.
-    build_inner_miter_vertex_cap_faces(
+    # 2b. Build CORNER2 miter triangles.
+    # These fill the 3-boundary bend vertices in C/U shaped selections.
+    build_corner2_miter_faces(
         transaction=transaction,
-        bevel_vertices=bevel_vertices,
-        vertex_boundaries=vertex_boundaries
+        vertex_boundaries=vertex_boundaries,
+        bm=bm,
+        bevel_vertices=bevel_vertices
     )
 
     debug_inner_miter_candidates(
@@ -473,7 +533,8 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_ve
             face_id=face_id,
             affected_vertex_ids=affected_vertex_ids,
             vertex_boundaries=vertex_boundaries,
-            bevel_vertices=bevel_vertices
+            bevel_vertices=bevel_vertices,
+            settings=settings
         )
 
     return transaction
@@ -482,41 +543,118 @@ def build_selection_transaction(edges_data, vertex_boundaries, bm=None, bevel_ve
 # -----------------------------------------------------------------------------
 # F_CAP / inner face cap helpers
 # -----------------------------------------------------------------------------
-def is_chain2_inner_miter_candidate(bevel_vertex,
-                                    vertex_boundaries,
-                                    central_face_id=None):
+def get_edge_ring_ids_from_bevel_vertex(bevel_vertex):
     """
-    Return True if this bevel vertex is a first-pass candidate for
-    INNER_MITER_PATCH.
-
-    Boundary data lives in vertex_boundaries, not on BX_BevelVertex.
+    Return edge ids from bevel_vertex.edge_halves in cyclic order.
     """
 
-    vertex_id = getattr(bevel_vertex, "vertex_id", None)
+    edge_ring = []
 
-    if vertex_id is None:
+    for edge_half in list(getattr(bevel_vertex, "edge_halves", [])):
+        edge_id = getattr(edge_half, "edge_id", None)
+
+        if edge_id is not None:
+            edge_ring.append(edge_id)
+
+    return edge_ring
+
+
+def cyclic_gap_between_edge_ids(edge_ring, start_edge_id, end_edge_id):
+    """
+    Return edge ids encountered after start_edge_id until end_edge_id.
+    Non-inclusive.
+    """
+
+    if not edge_ring:
+        return []
+
+    if start_edge_id not in edge_ring:
+        return []
+
+    if end_edge_id not in edge_ring:
+        return []
+
+    count = len(edge_ring)
+    start_index = edge_ring.index(start_edge_id)
+
+    result = []
+    cursor = (start_index + 1) % count
+    safety = 0
+
+    while edge_ring[cursor] != end_edge_id:
+        result.append(edge_ring[cursor])
+
+        cursor = (cursor + 1) % count
+        safety += 1
+
+        if safety > count:
+            return []
+
+    return result
+
+
+def is_uneven_high_valence_chain_2_vertex(bevel_vertex):
+    """
+    Return True for selected_count == 2 vertices whose cyclic gaps are not
+    the ordinary clean CHAIN_2 case.
+
+    Clean old CHAIN_2 case:
+        two selected edges
+        exactly one non-selected middle edge on each side
+
+    Uneven high-valence case:
+        two selected edges
+        one side has 0, 2, 3, ... middle edges
+        or the edge ring has more complicated topology
+
+    These must NOT use old INNER_MITER local triangle logic.
+    """
+
+    selected_edges = get_bevel_vertex_selected_edges(bevel_vertex)
+
+    if len(selected_edges) != 2:
         return False
 
-    kind = getattr(bevel_vertex, "kind", None)
-    selected_count = getattr(bevel_vertex, "selected_count", None)
+    edge_ring = get_edge_ring_ids_from_bevel_vertex(bevel_vertex)
 
-    if kind != "CHAIN_2":
+    if len(edge_ring) <= 2:
         return False
 
-    if selected_count != 2:
+    edge_a_id = selected_edges[0]
+    edge_b_id = selected_edges[1]
+
+    gap_ab = cyclic_gap_between_edge_ids(
+        edge_ring=edge_ring,
+        start_edge_id=edge_a_id,
+        end_edge_id=edge_b_id
+    )
+
+    gap_ba = cyclic_gap_between_edge_ids(
+        edge_ring=edge_ring,
+        start_edge_id=edge_b_id,
+        end_edge_id=edge_a_id
+    )
+
+    # Adjacent selected edges are CORNER_2 territory.
+    # Do not classify them as uneven CHAIN_2.
+    if not gap_ab or not gap_ba:
         return False
 
-    boundary_vertices = vertex_boundaries.get(vertex_id, [])
-
-    if len(boundary_vertices) < 4:
+    # Old CHAIN_2 inner-miter is safe only for balanced one-middle each side.
+    if len(gap_ab) == 1 and len(gap_ba) == 1:
         return False
 
-    if central_face_id is None:
-        return True
+    BX_log.warn(
+        "INNER_MITER skipped uneven high-valence CHAIN_2 vertex {0}: selected={1}, ring={2}, gap_ab={3}, gap_ba={4}".format(
+            getattr(bevel_vertex, "vertex_id", getattr(bevel_vertex, "id", None)),
+            selected_edges,
+            edge_ring,
+            gap_ab,
+            gap_ba
+        ),
+        channel="summary"
+    )
 
-    # Important: CHAIN_2 boundary verts are usually on neighboring support faces,
-    # not necessarily directly on central face 1. So do not require face 1 here
-    # unless you specifically want that filter.
     return True
 
 def get_bevel_vertex_selected_edges(bevel_vertex):
@@ -547,12 +685,11 @@ def get_bevel_vertex_selected_edges(bevel_vertex):
 
     return result
 
-
 def debug_inner_miter_candidates(bevel_vertices,
                                  vertex_boundaries,
                                  central_face_id=None):
     """
-    Print likely INNER_MITER_PATCH candidates.
+    Log likely INNER_MITER_PATCH candidates.
 
     For the current BevelX data model:
         - topology kind may not be stored on BX_BevelVertex
@@ -563,18 +700,31 @@ def debug_inner_miter_candidates(bevel_vertices,
         - exactly 2 selected/beveled edges
         - exactly 4 boundary vertices
 
-    This catches current CHAIN_2 vertices:
-        40, 41, 42, 43
-    and excludes current CORNER_2 vertices:
-        46, 47, 50, 51, 54, 55, 58, 59
+    This catches current CHAIN_2 vertices and excludes current CORNER_2
+    vertices.
+
+    Logging behavior:
+        - completely silent unless the "miter" channel is enabled
+        - per-vertex inspection is TRACE
+        - candidate summaries are DEBUG
+        - skip messages are DEBUG
     """
 
+    if not BX_log.is_enabled("DEBUG", "miter"):
+        return
+
     if bevel_vertices is None:
-        print("[BevelX] INNER_MITER debug skipped: bevel_vertices is None.")
+        BX_log.debug(
+            "INNER_MITER debug skipped: bevel_vertices is None.",
+            channel="miter"
+        )
         return
 
     if vertex_boundaries is None:
-        print("[BevelX] INNER_MITER debug skipped: vertex_boundaries is None.")
+        BX_log.debug(
+            "INNER_MITER debug skipped: vertex_boundaries is None.",
+            channel="miter"
+        )
         return
 
     if hasattr(bevel_vertices, "items"):
@@ -603,11 +753,14 @@ def debug_inner_miter_candidates(bevel_vertices,
         selected_count = len(selected_edges)
         boundary_count = len(boundary_vertices)
 
-        print("[BevelX] INNER_MITER inspect vertex {0}: selected_edges={1}, boundary_count={2}".format(
-            vertex_id,
-            selected_edges,
-            boundary_count
-        ))
+        BX_log.trace(
+            "INNER_MITER inspect vertex {0}: selected_edges={1}, boundary_count={2}".format(
+                vertex_id,
+                selected_edges,
+                boundary_count
+            ),
+            channel="miter"
+        )
 
         if selected_count != 2:
             continue
@@ -624,20 +777,32 @@ def debug_inner_miter_candidates(bevel_vertices,
                 "{0}: face={1}, edge={2}".format(
                     getattr(boundary_vertex, "id", "?"),
                     boundary_vertex_face_id(boundary_vertex),
-                    getattr(boundary_vertex, "edge", getattr(boundary_vertex, "edge_id", "?"))
+                    getattr(
+                        boundary_vertex,
+                        "edge",
+                        getattr(boundary_vertex, "edge_id", "?")
+                    )
                 )
             )
 
-        print("[BevelX] INNER_MITER candidate vertex {0}:".format(vertex_id))
-        print("[BevelX]   selected_edges={0}, boundary_count={1}".format(
-            selected_edges,
-            boundary_count
-        ))
-        print("[BevelX]   boundaries: {0}".format(boundary_debug))
+        BX_log.debug(
+            "INNER_MITER candidate vertex {0}: selected_edges={1}, boundary_count={2}".format(
+                vertex_id,
+                selected_edges,
+                boundary_count
+            ),
+            channel="miter"
+        )
 
-    print("[BevelX] INNER_MITER candidate debug found {0} candidates.".format(
-        found
-    ))
+        BX_log.debug(
+            "  boundaries: {0}".format(boundary_debug),
+            channel="miter"
+        )
+
+    BX_log.debug(
+        "INNER_MITER candidate debug found {0} candidates.".format(found),
+        channel="miter"
+    )
 
 #######################################################
 # just for now, I really am unsure of this values. debug print shows BX_BoundaryVertex(... face=44 ...), so...
@@ -783,24 +948,169 @@ def make_fallback_tangent(normal):
 
     return bxm.normalize(tangent)
 
+def vertex_has_chain_2_multi_gap_boundaries(vertex_boundaries, vertex_id):
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    for boundary_vertex in boundary_list:
+        if getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_GAP":
+            return True
+
+    return False
+
+def find_chain_2_multi_gap_boundary_for_face_edge(vertex_boundaries,
+                                                  vertex_id,
+                                                  edge_id,
+                                                  face_id):
+    """
+    Find the shared gap boundary for edge_id at vertex_id.
+
+    Works for:
+        - selected edge side aliases, matched by selected_edge_id + face_id
+        - middle edge aliases, matched by edge_on_id
+    """
+
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    # First: exact selected-edge face alias.
+    for boundary_vertex in boundary_list:
+        if getattr(boundary_vertex, "source", None) != "CHAIN_2_MULTI_GAP":
+            continue
+
+        if getattr(boundary_vertex, "selected_edge_id", None) == edge_id:
+            if getattr(boundary_vertex, "face_id", None) == face_id:
+                return boundary_vertex
+
+    # Second: middle/non-selected edge alias.
+    for boundary_vertex in boundary_list:
+        if getattr(boundary_vertex, "source", None) != "CHAIN_2_MULTI_GAP":
+            continue
+
+        if getattr(boundary_vertex, "edge_on_id", None) == edge_id:
+            return boundary_vertex
+
+    return None
+
+def build_chain_2_multi_gap_face_vertex_replacement(transaction,
+                                                    bm,
+                                                    face_id,
+                                                    face_vertices,
+                                                    vertex_index,
+                                                    vertex_id,
+                                                    vertex_boundaries):
+    """
+    Replace a high-valence CHAIN_2_MULTI vertex using gap aliases.
+
+    Source face:
+        prev_v -> vertex_id -> next_v
+
+    Replacement:
+        gap boundary for prev edge
+        gap boundary for next edge
+
+    If both edges map to the same gap boundary, collapse to one tx vertex.
+    That is expected and Blender-like.
+    """
+
+    count = len(face_vertices)
+
+    prev_v = face_vertices[(vertex_index - 1) % count]
+    next_v = face_vertices[(vertex_index + 1) % count]
+
+    prev_edge_id = get_edge_id_between_vertices(
+        bm=bm,
+        vertex_a=prev_v,
+        vertex_b=vertex_id
+    )
+
+    next_edge_id = get_edge_id_between_vertices(
+        bm=bm,
+        vertex_a=vertex_id,
+        vertex_b=next_v
+    )
+
+    boundary_prev = find_chain_2_multi_gap_boundary_for_face_edge(
+        vertex_boundaries=vertex_boundaries,
+        vertex_id=vertex_id,
+        edge_id=prev_edge_id,
+        face_id=face_id
+    )
+
+    boundary_next = find_chain_2_multi_gap_boundary_for_face_edge(
+        vertex_boundaries=vertex_boundaries,
+        vertex_id=vertex_id,
+        edge_id=next_edge_id,
+        face_id=face_id
+    )
+
+    if boundary_prev is None or boundary_next is None:
+        BX_log.warn(
+            "CHAIN_2_MULTI GAP replacement failed at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}".format(
+                vertex_id,
+                face_id,
+                prev_edge_id,
+                next_edge_id,
+                getattr(boundary_prev, "id", None),
+                getattr(boundary_next, "id", None)
+            ),
+            channel="summary"
+        )
+        return None
+
+    boundary_prev, boundary_next = order_support_boundary_pair(
+        bm=bm,
+        face_vertices=face_vertices,
+        vertex_index=vertex_index,
+        vertex_id=vertex_id,
+        boundary_a=boundary_prev,
+        boundary_b=boundary_next
+    )
+
+    tx_prev = transaction.add_boundary_vertex(boundary_prev)
+    tx_next = transaction.add_boundary_vertex(boundary_next)
+
+    tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=[tx_prev, tx_next]
+    )
+
+    if not tx_ids:
+        return None
+
+    BX_log.warn(
+        "CHAIN_2_MULTI GAP replacement at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}, tx={6}".format(
+            vertex_id,
+            face_id,
+            prev_edge_id,
+            next_edge_id,
+            getattr(boundary_prev, "id", None),
+            getattr(boundary_next, "id", None),
+            tx_ids
+        ),
+        channel="summary"
+    )
+
+    return tx_ids
+
 def build_reconstructed_face_for_selection(transaction,
                                            bm,
                                            face_id,
                                            affected_vertex_ids,
                                            vertex_boundaries,
-                                           bevel_vertices=None):
+                                           bevel_vertices=None,
+                                           settings=None):
     """
     Build F_RECON for a face affected by a selected edge set.
 
-    This handles:
-        - faces directly containing selected edges
-        - support faces touching only one affected endpoint
-        - simple CORNER_2 boundaries
+    Stable 2.0 rule:
+        If an affected vertex has a boundary vertex directly associated
+        with this face, use it.
 
-    Rule:
-        If an affected vertex has a boundary vertex for this face, use it.
-        Otherwise, replace the vertex with the two boundary vertices from
-        neighboring faces across the previous/next face edges.
+    TERMINAL_MULTI addition:
+        Only if there is no direct boundary for this face, try the
+        TERMINAL_MULTI two-point support replacement.
+
+    This prevents selected-edge source faces from intruding over the F_EDGE
+    bevel strip.
     """
 
     face = bm.faces[face_id]
@@ -808,9 +1118,10 @@ def build_reconstructed_face_for_selection(transaction,
 
     rebuilt_tx_ids = []
 
-    count = len(face_vertices)
-
     for i, current_v in enumerate(face_vertices):
+        # ------------------------------------------------------------
+        # Untouched original vertex.
+        # ------------------------------------------------------------
         if current_v not in affected_vertex_ids:
             rebuilt_tx_ids.append(
                 transaction.add_original_vertex(
@@ -820,10 +1131,18 @@ def build_reconstructed_face_for_selection(transaction,
             )
             continue
 
+        # ------------------------------------------------------------
         # Case A:
-        # This affected vertex has a boundary point directly associated
-        # with this face. This is the common case for faces containing
-        # selected edges or corner miter faces.
+        # Direct face-owned boundary.
+        #
+        # This MUST remain first.
+        #
+        # For faces that directly contain the selected edge, this gives
+        # the selected-edge rail point for this source face.
+        #
+        # If TERMINAL_MULTI runs before this, F_RECON can intrude over
+        # the F_EDGE bevel strip.
+        # ------------------------------------------------------------
         direct_boundary = find_boundary(
             vertex_boundaries,
             current_v,
@@ -836,9 +1155,81 @@ def build_reconstructed_face_for_selection(transaction,
             )
             continue
 
+        # ------------------------------------------------------------
+        # CHAIN_2_MULTI gap-boundary replacement.
+        #
+        # This must run before legacy support replacement.
+        # Legacy support replacement crosses to neighboring selected-edge
+        # anchors and creates skinny strips at high-valence pass-through
+        # vertices.
+        # ------------------------------------------------------------
+        if vertex_has_chain_2_multi_gap_boundaries(
+            vertex_boundaries=vertex_boundaries,
+            vertex_id=current_v
+        ):
+            replacement_ids = build_chain_2_multi_gap_face_vertex_replacement(
+                transaction=transaction,
+                bm=bm,
+                face_id=face_id,
+                face_vertices=face_vertices,
+                vertex_index=i,
+                vertex_id=current_v,
+                vertex_boundaries=vertex_boundaries
+            )
+
+            if replacement_ids:
+                rebuilt_tx_ids.extend(replacement_ids)
+                continue
+
+        # ------------------------------------------------------------
         # Case B:
-        # This face touches the affected vertex but does not directly own
-        # a boundary vertex for that face. This is a support face.
+        # TERMINAL_MULTI support-face replacement.
+        #
+        # This only runs when the current source face does NOT directly
+        # own a boundary point for this affected vertex.
+        #
+        # In other words:
+        #     selected-edge adjacent faces use direct_boundary
+        #     support faces use two terminal-multi boundary points
+        # ------------------------------------------------------------
+        if vertex_has_terminal_multi_boundaries(
+            vertex_boundaries=vertex_boundaries,
+            vertex_id=current_v
+        ):
+            replacement_ids = build_terminal_multi_face_vertex_replacement(
+                transaction=transaction,
+                bm=bm,
+                face_vertices=face_vertices,
+                vertex_index=i,
+                vertex_id=current_v,
+                vertex_boundaries=vertex_boundaries
+            )
+
+            if replacement_ids:
+                rebuilt_tx_ids.extend(replacement_ids)
+                continue
+
+            BX_log.warn(
+                "TERMINAL_MULTI support replacement failed at vertex {0} on face {1}; falling back to legacy support replacement.".format(
+                    current_v,
+                    face_id
+                ),
+                channel="summary"
+            )
+
+        # ------------------------------------------------------------
+        # Case C:
+        # Legacy 2.0 support-face replacement.
+        # ------------------------------------------------------------
+        if current_v == 64:
+            BX_log.warn(
+                "F_RECON inspect vertex 64 on face {0}: face_vertices={1}".format(
+                    face_id,
+                    face_vertices
+                ),
+                channel="summary"
+            )
+
         replacement_ids = build_support_face_vertex_replacement(
             transaction=transaction,
             bm=bm,
@@ -851,14 +1242,17 @@ def build_reconstructed_face_for_selection(transaction,
 
         if replacement_ids:
             rebuilt_tx_ids.extend(replacement_ids)
-        else:
-            # Conservative fallback.
-            rebuilt_tx_ids.append(
-                transaction.add_original_vertex(
-                    bm=bm,
-                    original_vertex_id=current_v
-                )
+            continue
+
+        # ------------------------------------------------------------
+        # Final conservative fallback.
+        # ------------------------------------------------------------
+        rebuilt_tx_ids.append(
+            transaction.add_original_vertex(
+                bm=bm,
+                original_vertex_id=current_v
             )
+        )
 
     expected_normal = list(face.normal_world)
 
@@ -868,22 +1262,37 @@ def build_reconstructed_face_for_selection(transaction,
         expected_normal=expected_normal
     )
 
-    # Avoid degenerate faces.
     if len(rebuilt_tx_ids) < 3:
-        print("[BevelX] F_RECON skipped for face {0}: fewer than 3 verts.".format(face_id))
+        BX_log.warn(
+            "F_RECON skipped for face {0}: fewer than 3 verts.".format(
+                face_id
+            ),
+            channel="transaction"
+        )
         return None
 
-    # Inner cap mode:
-    # If the rebuilt face is a large all-boundary polygon, turn it into
-    # an explicit cap instead of a normal reconstructed face.
-    if should_build_inner_cap_face(transaction=transaction, face_indices=rebuilt_tx_ids):
-        build_inner_cap_auto(
+    build_inner_miter_local_caps_for_face(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        face_indices=rebuilt_tx_ids,
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries
+    )
+
+    if should_build_inner_cap_face(
+        transaction=transaction,
+        face_indices=rebuilt_tx_ids
+    ):
+        build_inner_cap_by_mode(
             transaction=transaction,
             bm=bm,
             face_id=face_id,
             face_indices=rebuilt_tx_ids,
             bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries
+            vertex_boundaries=vertex_boundaries,
+            mode=(settings or {}).get("inner_cap_mode", INNER_CAP_AUTO),
+            build_local_miters=False
         )
 
         return None
@@ -894,6 +1303,201 @@ def build_reconstructed_face_for_selection(transaction,
         source_face_id=face_id,
         expected_normal=expected_normal
     )
+
+def distance_point_to_segment(point, segment_a, segment_b):
+    """
+    Distance from point to segment AB.
+    """
+
+    closest = bxm.closest_point_on_segment(
+        point,
+        segment_a,
+        segment_b
+    )
+
+    return bxm.distance(point, closest)
+
+
+def boundary_distance_to_segment(boundary_vertex, segment_a, segment_b):
+    """
+    Distance from a boundary vertex point to a segment.
+    """
+
+    return distance_point_to_segment(
+        boundary_vertex.co_world,
+        segment_a,
+        segment_b
+    )
+
+
+def order_support_boundary_pair(bm,
+                                face_vertices,
+                                vertex_index,
+                                vertex_id,
+                                boundary_a,
+                                boundary_b):
+    """
+    Order two boundary vertices for replacing one original vertex in a support face.
+
+    The face loop contains:
+        prev_v -> vertex_id -> next_v
+
+    The correct replacement order is:
+        boundary closest to prev edge
+        boundary closest to next edge
+    """
+
+    count = len(face_vertices)
+
+    prev_v = face_vertices[(vertex_index - 1) % count]
+    next_v = face_vertices[(vertex_index + 1) % count]
+
+    vertex_point = bm.vertices[vertex_id].co_world
+    prev_point = bm.vertices[prev_v].co_world
+    next_point = bm.vertices[next_v].co_world
+
+    # Original local face path:
+    #     prev_v -> vertex_id -> next_v
+    #
+    # So replacement order should be:
+    #     boundary near prev edge, boundary near next edge
+    score_as_given = (
+        boundary_distance_to_segment(boundary_a, prev_point, vertex_point) +
+        boundary_distance_to_segment(boundary_b, vertex_point, next_point)
+    )
+
+    score_swapped = (
+        boundary_distance_to_segment(boundary_b, prev_point, vertex_point) +
+        boundary_distance_to_segment(boundary_a, vertex_point, next_point)
+    )
+
+    if score_swapped < score_as_given:
+        return boundary_b, boundary_a
+
+    return boundary_a, boundary_b
+
+######################################################################
+# Build Replacement and Helpers.
+######################################################################
+
+def build_terminal_multi_face_vertex_replacement(transaction,
+                                                 bm,
+                                                 face_vertices,
+                                                 vertex_index,
+                                                 vertex_id,
+                                                 vertex_boundaries):
+    """
+    Replace a TERMINAL_MULTI original vertex inside one source face.
+
+    This deliberately avoids role-specific logic.
+
+    For the original face loop:
+
+        prev_v -> vertex_id -> next_v
+
+    choose:
+        - boundary closest to prev_v -> vertex_id
+        - boundary closest to vertex_id -> next_v
+
+    This keeps the replacement in local face-loop order and avoids the previous
+    A/B swapped sector problems.
+    """
+
+    boundary_list = [
+        boundary_vertex
+        for boundary_vertex in vertex_boundaries.get(vertex_id, [])
+        if getattr(boundary_vertex, "source", None) == "TERMINAL_MULTI"
+    ]
+
+    if len(boundary_list) < 2:
+        return None
+
+    count = len(face_vertices)
+
+    prev_v = face_vertices[(vertex_index - 1) % count]
+    next_v = face_vertices[(vertex_index + 1) % count]
+
+    vertex_point = bm.vertices[vertex_id].co_world
+    prev_point = bm.vertices[prev_v].co_world
+    next_point = bm.vertices[next_v].co_world
+
+    unique_boundaries = []
+
+    for boundary_vertex in boundary_list:
+        exists = False
+
+        for existing_boundary in unique_boundaries:
+            if transaction_points_are_close(
+                boundary_vertex.co_world,
+                existing_boundary.co_world
+            ):
+                exists = True
+                break
+
+        if not exists:
+            unique_boundaries.append(boundary_vertex)
+
+    if len(unique_boundaries) < 2:
+        return None
+
+    boundary_prev = min(
+        unique_boundaries,
+        key=lambda boundary_vertex: boundary_distance_to_segment(
+            boundary_vertex,
+            prev_point,
+            vertex_point
+        )
+    )
+
+    remaining = [
+        boundary_vertex
+        for boundary_vertex in unique_boundaries
+        if boundary_vertex is not boundary_prev
+    ]
+
+    if not remaining:
+        return None
+
+    boundary_next = min(
+        remaining,
+        key=lambda boundary_vertex: boundary_distance_to_segment(
+            boundary_vertex,
+            vertex_point,
+            next_point
+        )
+    )
+
+    boundary_prev, boundary_next = order_support_boundary_pair(
+        bm=bm,
+        face_vertices=face_vertices,
+        vertex_index=vertex_index,
+        vertex_id=vertex_id,
+        boundary_a=boundary_prev,
+        boundary_b=boundary_next
+    )
+
+    tx_ids = [
+        transaction.add_boundary_vertex(boundary_prev),
+        transaction.add_boundary_vertex(boundary_next)
+    ]
+
+    tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=tx_ids
+    )
+
+    if len(tx_ids) < 2:
+        return None
+
+    BX_log.warn(
+        "TERMINAL_MULTI face replacement at vertex {0}: verts={1}".format(
+            vertex_id,
+            tx_ids
+        ),
+        channel="summary"
+    )
+
+    return tx_ids
 
 def build_support_face_vertex_replacement(transaction,
                                           bm,
@@ -917,65 +1521,187 @@ def build_support_face_vertex_replacement(transaction,
     prev_v = face_vertices[(vertex_index - 1) % count]
     next_v = face_vertices[(vertex_index + 1) % count]
 
-    prev_edge_id = get_edge_id_between_vertices(
-        bm=bm,
-        vertex_a=prev_v,
-        vertex_b=vertex_id
-    )
+    prev_edge_id = get_edge_id_between_vertices(bm=bm, vertex_a=prev_v, vertex_b=vertex_id)
+    next_edge_id = get_edge_id_between_vertices(bm=bm, vertex_a=vertex_id,vertex_b=next_v)
+    prev_other_face = get_other_face_on_edge(bm=bm, edge_id=prev_edge_id, current_face_id=face_id)
+    next_other_face = get_other_face_on_edge(bm=bm, edge_id=next_edge_id, current_face_id=face_id)
 
-    next_edge_id = get_edge_id_between_vertices(
-        bm=bm,
-        vertex_a=vertex_id,
-        vertex_b=next_v
-    )
-
-    prev_other_face = get_other_face_on_edge(
-        bm=bm,
-        edge_id=prev_edge_id,
-        current_face_id=face_id
-    )
-
-    next_other_face = get_other_face_on_edge(
-        bm=bm,
-        edge_id=next_edge_id,
-        current_face_id=face_id
-    )
-
-    if prev_other_face is None or next_other_face is None:
-        print(
-            "[BevelX] Support replacement failed at vertex {0} on face {1}: "
-            "could not find neighboring faces.".format(vertex_id, face_id)
-        )
-        return None
-
-    boundary_prev = find_boundary(
-        vertex_boundaries,
-        vertex_id,
-        prev_other_face
-    )
-
-    boundary_next = find_boundary(
-        vertex_boundaries,
-        vertex_id,
-        next_other_face
-    )
-
-    if boundary_prev is None or boundary_next is None:
-        print(
-            "[BevelX] Support replacement failed at vertex {0} on face {1}: "
-            "missing boundaries for neighboring faces {2}, {3}.".format(
-                vertex_id,
+    if vertex_id == 64:
+        BX_log.warn(
+            "SUPPORT inspect vertex 64 on face {0}: prev_v={1}, next_v={2}, prev_edge={3}, next_edge={4}, prev_other_face={5}, next_other_face={6}".format(
                 face_id,
+                prev_v,
+                next_v,
+                prev_edge_id,
+                next_edge_id,
                 prev_other_face,
                 next_other_face
-            )
+            ),
+            channel="summary"
         )
+
+    if prev_other_face is None or next_other_face is None:
+        BX_log.debug("Support replacement failed at vertex {0} on face {1}: could not find neighboring faces.".format(
+                vertex_id, face_id), channel="support")
         return None
 
-    return [
+    boundary_prev = find_boundary(vertex_boundaries, vertex_id, prev_other_face)
+    boundary_next = find_boundary(vertex_boundaries, vertex_id, next_other_face)
+
+    if boundary_prev is None or boundary_next is None:
+        fallback_ids = build_support_replacement_from_available_boundaries(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_vertices=face_vertices,
+            vertex_index=vertex_index,
+            vertex_id=vertex_id,
+            vertex_boundaries=vertex_boundaries
+        )
+        if fallback_ids:
+            BX_log.debug("Support replacement fallback used at vertex {0} on face {1}: verts={2}".format(
+                    vertex_id,
+                    face_id,
+                    fallback_ids
+                ),channel="support"
+            )
+            return fallback_ids
+        BX_log.debug(
+            "Support replacement failed at vertex {0} on face {1}: missing boundaries for neighboring faces {2}, {3}.".format(
+                vertex_id, face_id, prev_other_face, next_other_face), channel="support")
+        return None
+
+    boundary_prev, boundary_next = order_support_boundary_pair(
+        bm=bm,
+        face_vertices=face_vertices,
+        vertex_index=vertex_index,
+        vertex_id=vertex_id,
+        boundary_a=boundary_prev,
+        boundary_b=boundary_next
+    )
+
+    tx_prev = transaction.add_boundary_vertex(boundary_prev)
+    tx_next = transaction.add_boundary_vertex(boundary_next)
+
+    if vertex_id == 64:
+        BX_log.warn(
+            "SUPPORT replacement vertex 64 on face {0}: boundary_prev={1}, boundary_next={2}, tx=[{3}, {4}]".format(
+                face_id,
+                getattr(boundary_prev, "id", None),
+                getattr(boundary_next, "id", None),
+                tx_prev,
+                tx_next
+            ),
+            channel="summary"
+        )
+
+    return [tx_prev, tx_next]
+
+def build_support_replacement_from_available_boundaries(transaction,
+                                                        bm,
+                                                        face_id,
+                                                        face_vertices,
+                                                        vertex_index,
+                                                        vertex_id,
+                                                        vertex_boundaries):
+    """
+    Fallback support-face replacement.
+
+    Important:
+        This must not blindly insert every boundary around the vertex.
+
+    For the current support face, replace the original vertex with exactly two
+    boundary vertices:
+        - one closest to the previous face edge
+        - one closest to the next face edge
+
+    This preserves the local original face order:
+        prev_v -> vertex_id -> next_v
+    """
+
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    if not boundary_list:
+        return None
+
+    count = len(face_vertices)
+
+    prev_v = face_vertices[(vertex_index - 1) % count]
+    next_v = face_vertices[(vertex_index + 1) % count]
+
+    vertex_point = bm.vertices[vertex_id].co_world
+    prev_point = bm.vertices[prev_v].co_world
+    next_point = bm.vertices[next_v].co_world
+
+    unique_boundaries = []
+
+    for boundary_vertex in boundary_list:
+        exists = False
+
+        for existing_boundary in unique_boundaries:
+            if transaction_points_are_close(
+                boundary_vertex.co_world,
+                existing_boundary.co_world
+            ):
+                exists = True
+                break
+
+        if not exists:
+            unique_boundaries.append(boundary_vertex)
+
+    if len(unique_boundaries) < 2:
+        return None
+
+    boundary_prev = min(
+        unique_boundaries,
+        key=lambda boundary_vertex: boundary_distance_to_segment(
+            boundary_vertex,
+            prev_point,
+            vertex_point
+        )
+    )
+
+    remaining = [
+        boundary_vertex
+        for boundary_vertex in unique_boundaries
+        if boundary_vertex is not boundary_prev
+    ]
+
+    if not remaining:
+        return None
+
+    boundary_next = min(
+        remaining,
+        key=lambda boundary_vertex: boundary_distance_to_segment(
+            boundary_vertex,
+            vertex_point,
+            next_point
+        )
+    )
+
+    boundary_prev, boundary_next = order_support_boundary_pair(
+        bm=bm,
+        face_vertices=face_vertices,
+        vertex_index=vertex_index,
+        vertex_id=vertex_id,
+        boundary_a=boundary_prev,
+        boundary_b=boundary_next
+    )
+
+    tx_ids = [
         transaction.add_boundary_vertex(boundary_prev),
         transaction.add_boundary_vertex(boundary_next),
     ]
+
+    tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=tx_ids
+    )
+
+    if len(tx_ids) < 2:
+        return None
+
+    return tx_ids
 
 def build_inner_cap_fan(transaction, bm, face_id, face_indices):
     """
@@ -1031,26 +1757,15 @@ def build_inner_cap_fan(transaction, bm, face_id, face_indices):
         )
 
         if len(tri_ids) != 3:
-            print("[BevelX] F_PATCH skipped non-triangle fan face on face {0}: verts={1}".format(
-                face_id,
-                tri_ids
-            ))
+            BX_log.debug("F_PATCH skipped non-triangle fan face on face {0}: verts={1}".format(
+                face_id, tri_ids), channel="caps"
+            )
             continue
 
-        area = transaction_triangle_area(
-            transaction=transaction,
-            vertex_ids=tri_ids
-        )
-
-        if is_degenerate_transaction_triangle(
-            transaction=transaction,
-            vertex_ids=tri_ids
-        ):
-            print("[BevelX] F_PATCH skipped degenerate fan triangle on face {0}: verts={1}, area={2}".format(
-                face_id,
-                tri_ids,
-                area
-            ))
+        area = transaction_triangle_area(transaction=transaction, vertex_ids=tri_ids)
+        if is_degenerate_transaction_triangle(transaction=transaction, vertex_ids=tri_ids):
+            BX_log.debug("F_PATCH skipped degenerate fan triangle on face {0}: verts={1}, area={2}".format(
+                    face_id, tri_ids, area), channel="caps")
             continue
 
         patch_face = transaction.add_face(
@@ -1063,11 +1778,8 @@ def build_inner_cap_fan(transaction, bm, face_id, face_indices):
         patch_faces.append(patch_face)
 
     if len(patch_faces) != count:
-        print("[BevelX] F_PATCH fan warning on face {0}: built {1}/{2} triangles.".format(
-            face_id,
-            len(patch_faces),
-            count
-        ))
+        BX_log.debug("F_PATCH fan warning on face {0}: built {1}/{2} triangles.".format(
+                face_id, len(patch_faces), count), channel="caps")
 
     return patch_faces
 
@@ -1090,10 +1802,8 @@ def build_inner_cap_adj_lite(transaction,
     It is not full Blender M_ADJ yet. It is a stable, readable,
     segments=1 patch that avoids fan spokes across the whole cap.
     """
-    print("[BevelX] Inner cap ADJ_LITE entered on face {0}: outer verts={1}".format(
-        face_id,
-        face_indices
-    ))
+    BX_log.debug("Inner cap ADJ_LITE entered on face {0}: outer verts={1}".format(
+            face_id, face_indices), channel="caps")
 
 
     face = bm.faces[face_id]
@@ -1115,9 +1825,8 @@ def build_inner_cap_adj_lite(transaction,
     )
 
     if len(sorted_outer_ids) < 3:
-        print("[BevelX] F_PATCH ADJ_LITE skipped for face {0}: fewer than 3 boundary verts.".format(
-            face_id
-        ))
+        BX_log.debug("F_PATCH ADJ_LITE skipped for face {0}: fewer than 3 boundary verts.".format(
+                face_id), channel="caps")
         return []
 
     center = calculate_transaction_polygon_center(
@@ -1209,11 +1918,8 @@ def build_inner_cap_adj_lite(transaction,
             transaction=transaction,
             vertex_ids=quad_ids
         ):
-            print("[BevelX] F_PATCH ADJ_LITE skipped degenerate quad on face {0}: verts={1}, area={2}".format(
-                face_id,
-                quad_ids,
-                area
-            ))
+            BX_log.debug("F_PATCH ADJ_LITE skipped degenerate quad on face {0}: verts={1}, area={2}".format(
+                face_id, quad_ids, area), channel="caps")
             continue
 
         face_kind = FACE_PATCH
@@ -1222,22 +1928,18 @@ def build_inner_cap_adj_lite(transaction,
             face_kind = FACE_INNER_MITER_PATCH
 
         patch_face = transaction.add_face(
-            vertex_ids=[outer_a, outer_b, inner_b, inner_a],
+            vertex_ids=quad_ids,
             face_kind=face_kind,
-            source_face_id=face_id
+            source_face_id=face_id,
+            expected_normal=expected_normal
         )
 
         if face_kind == FACE_INNER_MITER_PATCH:
             orig_id = get_transaction_vertex_original_id(
-                transaction=transaction,
-                tx_id=outer_a
+                transaction=transaction, tx_id=outer_a
             )
-
-            print("[BevelX] INNER_MITER_PATCH classified on face {0}, vertex {1}: verts={2}".format(
-                face_id,
-                orig_id,
-                [outer_a, outer_b, inner_b, inner_a]
-            ))
+            BX_log.debug("INNER_MITER_PATCH classified on face {0}, vertex {1}: verts={2}".format(
+                    face_id, orig_id, quad_ids), channel="miter")
 
         created_faces.append(patch_face)
 
@@ -1248,20 +1950,12 @@ def build_inner_cap_adj_lite(transaction,
         expected_normal=expected_normal
     )
 
-    center_area = transaction_polygon_area(
-        transaction=transaction,
-        vertex_ids=center_cap_ids
-    )
+    center_area = transaction_polygon_area(transaction=transaction, vertex_ids=center_cap_ids)
 
-    if is_degenerate_transaction_polygon(
-        transaction=transaction,
-        vertex_ids=center_cap_ids
-    ):
-        print("[BevelX] F_CAP ADJ_LITE skipped degenerate center cap on face {0}: verts={1}, area={2}".format(
-            face_id,
-            center_cap_ids,
-            center_area
-        ))
+    if is_degenerate_transaction_polygon(transaction=transaction, vertex_ids=center_cap_ids):
+        BX_log.debug(
+            "F_CAP ADJ_LITE skipped degenerate center cap on face {0}: verts={1}, area={2}".format(
+                face_id, center_cap_ids, center_area), channel="caps")
     else:
         center_face = transaction.add_face(
             vertex_ids=center_cap_ids,
@@ -1273,15 +1967,250 @@ def build_inner_cap_adj_lite(transaction,
         created_faces.append(center_face)
 
     if len(created_faces) == 0:
-        print("[BevelX] F_PATCH ADJ_LITE failed on face {0}: no patch faces built.".format(
-            face_id
-        ))
-    print("[BevelX] Inner cap ADJ_LITE built on face {0}: inner verts={1}, faces={2}".format(
-        face_id,
-        inner_ids,
-        len(created_faces)
-    ))
+        BX_log.debug("F_PATCH ADJ_LITE failed on face {0}: no patch faces built.".format(
+                face_id), channel="caps")
+        
+    BX_log.debug("Inner cap ADJ_LITE built on face {0}: inner verts={1}, faces={2}".format(
+            face_id, inner_ids, len(created_faces)), channel="caps")
 
+    return created_faces
+
+def build_inner_miter_local_caps_for_face(transaction,
+                                          bm,
+                                          face_id,
+                                          face_indices,
+                                          bevel_vertices=None,
+                                          vertex_boundaries=None):
+    """
+    Build small local CHAIN_2 inner-miter filler caps on this source face.
+
+    These caps are required regardless of central cap mode:
+        - NGON
+        - FAN
+        - ADJ_LITE
+        - AUTO
+
+    They fill the little black triangular holes that appear at CHAIN_2
+    inner-miter vertices. The central cap mode only decides how the large
+    middle region is filled.
+    """
+
+    created_faces = []
+
+    if bevel_vertices is None or vertex_boundaries is None:
+        return created_faces
+
+    face = bm.faces[face_id]
+
+    expected_normal = list(face.normal_world)
+    face_center = list(face.center_world)
+
+    sorted_face_ids = sort_transaction_vertices_on_face(
+        transaction=transaction,
+        vertex_ids=face_indices,
+        face_center=face_center,
+        face_normal=expected_normal
+    )
+
+    sorted_face_ids = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=sorted_face_ids,
+        expected_normal=expected_normal
+    )
+
+    if len(sorted_face_ids) < 3:
+        return created_faces
+
+    count = len(sorted_face_ids)
+
+    segment_is_inner_miter = []
+
+    for i in range(count):
+        outer_a = sorted_face_ids[i]
+        outer_b = sorted_face_ids[(i + 1) % count]
+
+        is_miter_segment = should_use_inner_miter_patch_for_outer_pair(
+            transaction=transaction,
+            outer_a_id=outer_a,
+            outer_b_id=outer_b,
+            bevel_vertices=bevel_vertices,
+            vertex_boundaries=vertex_boundaries
+        )
+
+        segment_is_inner_miter.append(is_miter_segment)
+
+    built_inner_miter_vertex_ids = set()
+
+    for i in range(count):
+        if not segment_is_inner_miter[i]:
+            continue
+
+        outer_a = sorted_face_ids[i]
+
+        orig_id = get_transaction_vertex_original_id(
+            transaction=transaction,
+            tx_id=outer_a
+        )
+
+        if orig_id is None:
+            continue
+
+        if orig_id in built_inner_miter_vertex_ids:
+            continue
+
+        built_inner_miter_vertex_ids.add(orig_id)
+
+        boundary_list = vertex_boundaries.get(orig_id, [])
+
+        if len(boundary_list) != 4:
+            BX_log.debug("INNER_MITER local cap skipped on face {0}, vertex {1}: expected 4 boundaries, got {2}".format(
+                    face_id, orig_id, len(boundary_list)), channel="miter")
+            continue
+
+        boundary_key = tuple(sorted([
+            getattr(boundary_vertex, "id", None)
+            for boundary_vertex in boundary_list
+        ]))
+
+        local_cap_key = (orig_id, boundary_key)
+
+        if local_cap_key in transaction.inner_miter_local_cap_keys:
+            BX_log.debug("INNER_MITER local cap skipped duplicate for vertex {0}: key={1}".format(
+                    orig_id, local_cap_key), channel="miter")
+            continue
+
+        local_cap_ids = [
+            transaction.add_boundary_vertex(boundary_vertex)
+            for boundary_vertex in boundary_list
+        ]
+
+        local_cap_ids = collapse_transaction_ids_by_position(transaction=transaction, tx_ids=local_cap_ids)
+
+        if len(local_cap_ids) < 3:
+            BX_log.debug("INNER_MITER local cap skipped on face {0}, vertex {1}: fewer than 3 unique verts={2}".format(
+                    face_id, orig_id, local_cap_ids), channel="miter")
+            continue
+
+        local_cap_ids = sort_transaction_vertices_on_face(
+            transaction=transaction,
+            vertex_ids=local_cap_ids,
+            face_center=face_center,
+            face_normal=expected_normal
+        )
+
+        local_cap_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=local_cap_ids,
+            expected_normal=expected_normal
+        )
+
+        if is_degenerate_transaction_polygon(transaction=transaction, vertex_ids=local_cap_ids):
+            BX_log.debug("INNER_MITER local cap skipped degenerate on face {0}, vertex {1}: verts={2}".format(
+                    face_id, orig_id, local_cap_ids), channel="miter")
+            continue
+
+        local_cap_face = transaction.add_face(
+            vertex_ids=local_cap_ids,
+            face_kind=FACE_INNER_MITER_PATCH,
+            source_face_id=face_id,
+            expected_normal=expected_normal
+        )
+
+        transaction.inner_miter_local_cap_keys.add(local_cap_key)
+
+        created_faces.append(local_cap_face)
+
+        BX_log.debug("INNER_MITER local cap built on face {0}, vertex {1}: verts={2}".format(
+                face_id, orig_id, local_cap_ids), channel="miter")
+
+    return created_faces
+
+def build_inner_cap_by_mode(transaction,
+                            bm,
+                            face_id,
+                            face_indices,
+                            bevel_vertices=None,
+                            vertex_boundaries=None,
+                            mode=INNER_CAP_AUTO,
+                            build_local_miters=True):
+    """
+    Build an inner cap using the requested UI/settings mode.
+    """
+
+    created_faces = []
+
+    if build_local_miters:
+        local_faces = build_inner_miter_local_caps_for_face(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_indices=face_indices,
+            bevel_vertices=bevel_vertices,
+            vertex_boundaries=vertex_boundaries
+        )
+
+        if local_faces:
+            created_faces.extend(local_faces)
+
+    if mode == INNER_CAP_NGON:
+        BX_log.debug("Inner cap mode NGON on face {0}.".format(face_id),
+                     channel="caps")
+
+        face = build_inner_cap_face(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_indices=face_indices
+        )
+
+        if face:
+            created_faces.append(face)
+
+        return created_faces
+
+    if mode == INNER_CAP_FAN:
+        BX_log.debug("Inner cap mode FAN on face {0}.".format(face_id),
+                     channel="caps")
+
+        faces = build_inner_cap_fan(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_indices=face_indices
+        )
+
+        created_faces.extend(faces)
+        return created_faces
+
+    if mode == INNER_CAP_ADJ_LITE:
+        BX_log.debug("Inner cap mode ADJ_LITE on face {0}.".format(face_id),
+                     channel="caps")
+
+        faces = build_inner_cap_adj_lite(
+            transaction=transaction,
+            bm=bm,
+            face_id=face_id,
+            face_indices=face_indices,
+            bevel_vertices=bevel_vertices,
+            vertex_boundaries=vertex_boundaries
+        )
+
+        created_faces.extend(faces)
+        return created_faces
+
+    BX_log.debug("Inner cap mode AUTO on face {0}.".format(face_id),
+                 channel="caps")
+
+    faces = build_inner_cap_auto(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        face_indices=face_indices,
+        bevel_vertices=bevel_vertices,
+        vertex_boundaries=vertex_boundaries
+    )
+
+    created_faces.extend(faces)
     return created_faces
 
 def build_inner_cap_auto(transaction,
@@ -1299,10 +2228,8 @@ def build_inner_cap_auto(transaction,
         3. Fallback to NGON.
     """
 
-    print("[BevelX] Inner cap AUTO entered on face {0}: verts={1}".format(
-        face_id,
-        face_indices
-    ))
+    BX_log.debug("Inner cap AUTO entered on face {0}: verts={1}".format(
+            face_id, face_indices), channel="caps")
 
     faces = build_inner_cap_adj_lite(
         transaction=transaction,
@@ -1314,15 +2241,12 @@ def build_inner_cap_auto(transaction,
     )
 
     if faces:
-        print("[BevelX] Inner cap AUTO used ADJ_LITE on face {0}: built {1} faces.".format(
-            face_id,
-            len(faces)
-        ))
+        BX_log.debug("Inner cap AUTO used ADJ_LITE on face {0}: built {1} faces.".format(
+            face_id,len(faces)),channel="caps")
         return faces
 
-    print("[BevelX] Inner cap AUTO ADJ_LITE failed on face {0}; falling back to FAN.".format(
-        face_id
-    ))
+    BX_log.debug("Inner cap AUTO ADJ_LITE failed on face {0}; falling back to FAN.".format(
+            face_id), channel="caps")
 
     faces = build_inner_cap_fan(
         transaction=transaction,
@@ -1332,15 +2256,12 @@ def build_inner_cap_auto(transaction,
     )
 
     if faces:
-        print("[BevelX] Inner cap AUTO fallback used FAN on face {0}: built {1} faces.".format(
-            face_id,
-            len(faces)
-        ))
+        BX_log.debug("Inner cap AUTO fallback used FAN on face {0}: built {1} faces.".format(
+            face_id,len(faces)),channel="caps")
         return faces
 
-    print("[BevelX] Inner cap AUTO FAN failed on face {0}; falling back to NGON.".format(
-        face_id
-    ))
+    BX_log.debug("Inner cap AUTO FAN failed on face {0}; falling back to NGON.".format(
+            face_id), channel="caps")
 
     face = build_inner_cap_face(
         transaction=transaction,
@@ -1350,14 +2271,12 @@ def build_inner_cap_auto(transaction,
     )
 
     if face:
-        print("[BevelX] Inner cap AUTO fallback used NGON on face {0}.".format(
-            face_id
-        ))
+        BX_log.debug("Inner cap AUTO fallback used NGON on face {0}.".format(
+            face_id),channel="caps")
         return [face]
 
-    print("[BevelX] Inner cap AUTO failed on face {0}.".format(
-        face_id
-    ))
+    BX_log.warn("Inner cap AUTO failed on face {0}.".format(face_id),
+                channel="caps")
 
     return []
 
@@ -1395,7 +2314,6 @@ def get_bevel_vertex_by_id(bevel_vertices, vertex_id):
 
     return None
 
-
 def is_inner_miter_candidate_vertex_id(vertex_id,
                                        bevel_vertices,
                                        vertex_boundaries):
@@ -1407,7 +2325,9 @@ def is_inner_miter_candidate_vertex_id(vertex_id,
         - exactly two selected/beveled edges
         - exactly four boundary vertices
 
-    This catches current CHAIN_2 candidates and excludes current CORNER_2.
+    Exclusion:
+        - uneven high-valence CHAIN_2 vertices must not use old local
+          inner-miter triangles.
     """
 
     bevel_vertex = get_bevel_vertex_by_id(
@@ -1416,6 +2336,9 @@ def is_inner_miter_candidate_vertex_id(vertex_id,
     )
 
     if bevel_vertex is None:
+        return False
+
+    if is_uneven_high_valence_chain_2_vertex(bevel_vertex):
         return False
 
     selected_edges = get_bevel_vertex_selected_edges(bevel_vertex)
@@ -1428,7 +2351,6 @@ def is_inner_miter_candidate_vertex_id(vertex_id,
         return False
 
     return True
-
 
 def should_use_inner_miter_patch_for_outer_pair(transaction,
                                                 outer_a_id,
@@ -1531,159 +2453,247 @@ def collapse_transaction_ids_by_position(transaction,
 
     return collapsed
 
-
-def add_local_inner_miter_face(transaction,
-                               tx_ids,
-                               source_vertex_id=None):
+def average_original_vertex_normal(bm, vertex_id):
     """
-    Add a local CHAIN_2 inner miter face.
-
-    Current expected case:
-        4 boundary verts -> 3 unique positions -> one triangle.
-
-    If there are 4 unique positions, add a small quad for now.
-    This keeps topology stable and avoids putting triangles on the
-    central ADJ-lite cap ring.
+    Return averaged normal from original faces touching vertex_id.
     """
 
-    unique_tx_ids = collapse_transaction_ids_by_position(
-        transaction=transaction,
-        tx_ids=tx_ids
-    )
-    # Current CHAIN_2 local cap winding is flipped.
-    # Reverse winding while preserving the first vertex as anchor.
-    if len(unique_tx_ids) >= 3:
-        unique_tx_ids = [unique_tx_ids[0]] + list(reversed(unique_tx_ids[1:]))
+    normal = [0.0, 0.0, 0.0]
 
-    if len(unique_tx_ids) < 3:
-        print("[BevelX] INNER_MITER vertex cap skipped for vertex {0}: fewer than 3 unique points, verts={1}".format(
-            source_vertex_id,
-            tx_ids
-        ))
+    for face_id in bm.vertices[vertex_id].faces:
+        normal = bxm.add(
+            normal,
+            bm.faces[face_id].normal_world
+        )
+
+    normal = bxm.normalize(normal)
+
+    if bxm.is_zero(normal):
+        return [0.0, 0.0, 0.0]
+
+    return normal
+
+def is_corner2_boundary_vertex(boundary_vertex):
+    """
+    Return True if this boundary vertex belongs to the current CORNER2 system.
+
+    Current code may expose this either through:
+        - boundary_vertex.source
+        - boundary_vertex.id text, for example BV7_CORNER2_F7
+    """
+
+    source = getattr(boundary_vertex, "source", "")
+    boundary_id = getattr(boundary_vertex, "id", "")
+
+    if "CORNER2" in str(source):
+        return True
+
+    if "CORNER_2" in str(source):
+        return True
+
+    if "CORNER2" in str(boundary_id):
+        return True
+
+    if "CORNER_2" in str(boundary_id):
+        return True
+
+    return False
+
+
+def build_corner2_miter_faces(transaction,
+                              vertex_boundaries,
+                              bm=None,
+                              bevel_vertices=None):
+    """
+    Build small triangular CORNER2 miter faces.
+
+    This handles the C/U-shaped segments=1 case where a bend vertex has:
+        - exactly 2 selected edges
+        - exactly 3 CORNER2 boundary vertices
+
+    Example from the log:
+        vertex 7: selected_edges=[9, 12], boundary_count=3
+        vertex 8: selected_edges=[12, 16], boundary_count=3
+
+    These triangles are different from CHAIN_2 inner-miter local caps:
+        - CHAIN_2 through usually has 4 boundaries
+        - CORNER2 bend has 3 boundaries
+    """
+
+    if vertex_boundaries is None:
         return []
 
-    if is_degenerate_transaction_polygon(
-        transaction=transaction,
-        vertex_ids=unique_tx_ids
-    ):
-        print("[BevelX] INNER_MITER vertex cap skipped degenerate for vertex {0}: verts={1}".format(
-            source_vertex_id,
-            unique_tx_ids
-        ))
-        return []
+    created_faces = []
 
-    points = [
-        transaction.vertices[tx_id].co_world
-        for tx_id in unique_tx_ids
+    for vertex_id in sorted(vertex_boundaries.keys()):
+        boundary_list = vertex_boundaries.get(vertex_id, [])
+
+        corner_boundaries = [
+            boundary_vertex
+            for boundary_vertex in boundary_list
+            if is_corner2_boundary_vertex(boundary_vertex)
+        ]
+
+        if len(corner_boundaries) != 3:
+            continue
+
+        if bevel_vertices is not None:
+            bevel_vertex = get_bevel_vertex_by_id(
+                bevel_vertices=bevel_vertices,
+                vertex_id=vertex_id
+            )
+
+            if bevel_vertex is not None:
+                selected_edges = get_bevel_vertex_selected_edges(bevel_vertex)
+
+                if len(selected_edges) != 2:
+                    continue
+
+        tx_vertex_ids = [
+            transaction.add_boundary_vertex(boundary_vertex)
+            for boundary_vertex in corner_boundaries
+        ]
+
+        tx_vertex_ids = collapse_transaction_ids_by_position(
+            transaction=transaction,
+            tx_ids=tx_vertex_ids
+        )
+
+        if len(tx_vertex_ids) != 3:
+            BX_log.debug("CORNER2 miter skipped for vertex {0}: expected 3 unique verts, got {1}".format(
+                    vertex_id,
+                    tx_vertex_ids
+                ),channel="caps"
+            )
+            continue
+
+        expected_normal = [0.0, 0.0, 0.0]
+        face_center = None
+
+        if bm is not None:
+            expected_normal = average_original_vertex_normal(
+                bm=bm,
+                vertex_id=vertex_id
+            )
+            face_center = list(bm.vertices[vertex_id].co_world)
+
+        if bxm.is_zero(expected_normal):
+            points = [
+                transaction.vertices[tx_id].co_world
+                for tx_id in tx_vertex_ids
+            ]
+            expected_normal = calculate_polygon_normal(points)
+
+        if face_center is not None:
+            tx_vertex_ids = sort_transaction_vertices_on_face(
+                transaction=transaction,
+                vertex_ids=tx_vertex_ids,
+                face_center=face_center,
+                face_normal=expected_normal
+            )
+
+        tx_vertex_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tx_vertex_ids,
+            expected_normal=expected_normal
+        )
+
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=tx_vertex_ids
+        ):
+            BX_log.debug("CORNER2 miter skipped degenerate triangle for vertex {0}: verts={1}".format(
+                    vertex_id,
+                    tx_vertex_ids
+                ),channel="caps"
+            )
+            continue
+
+        face = transaction.add_face(
+            vertex_ids=tx_vertex_ids,
+            face_kind=FACE_VERT,
+            source_face_id=None,
+            expected_normal=expected_normal
+        )
+
+        created_faces.append(face)
+
+        BX_log.debug("F_VERT CORNER2 miter triangle built for vertex {0}: verts={1}, expected_normal={2}".format(
+                vertex_id,
+                tx_vertex_ids,
+                expected_normal
+            ),channel="caps"
+        )
+
+    return created_faces
+
+def is_terminal_multi_boundary_vertex(boundary_vertex):
+    """
+    Return True if boundary_vertex belongs to the TERMINAL_MULTI system.
+    """
+
+    return getattr(boundary_vertex, "source", None) == "TERMINAL_MULTI"
+
+
+def get_terminal_multi_cap_boundaries(boundary_list):
+    """
+    Return TERMINAL_MULTI boundaries in the stored boundary-ring order.
+
+    Important:
+        BX_boundary.build_terminal_multi_edge_boundary_for_vertex() now builds
+        the ring in Blender-like order:
+
+            SELECTED_LEFT
+            SELECTED_RIGHT
+            ON_EDGE...
+        
+        So we preserve that order here instead of sorting or reversing.
+    """
+
+    return [
+        boundary_vertex
+        for boundary_vertex in boundary_list
+        if is_terminal_multi_boundary_vertex(boundary_vertex)
     ]
 
-    expected_normal = calculate_polygon_normal(points)
-
-    face = transaction.add_face(
-        vertex_ids=unique_tx_ids,
-        face_kind=FACE_INNER_MITER_PATCH,
-        source_face_id=None,
-        source_edge_id=None,
-        expected_normal=expected_normal
-    )
-
-    print("[BevelX] INNER_MITER vertex cap built for vertex {0}: verts={1}".format(
-        source_vertex_id,
-        unique_tx_ids
-    ))
-
-    return [face]
-
-
-def build_inner_miter_vertex_cap_faces(transaction,
-                                       bevel_vertices,
-                                       vertex_boundaries):
+def build_terminal_multi_cap_faces(transaction,
+                                   vertex_boundaries,
+                                   bm=None):
     """
-    Build missing CHAIN_2 inner miter vertex-cap faces.
+    Build F_VERT cap faces for TERMINAL_MULTI vertices.
 
-    These are NOT central cap ring faces.
+    This closes the terminal vertex hole created by one selected edge entering
+    a vertex with multiple other incident edges.
 
-    They fill the small triangular holes at CHAIN_2 vertices, between:
-        - the two selected-edge bevel strips
-        - the surrounding support/reconstructed faces
-        - the central cap boundary
+    Boundary count:
+        3     -> triangle cap
+        4+    -> ngon cap
 
-    Candidate rule:
-        - exactly 2 selected/beveled edges
-        - exactly 4 boundary vertices
-
-    In the current orthogonal case, the 4 boundaries collapse to 3
-    unique positions, producing the missing triangle.
+    Assumption:
+        TERMINAL_MULTI boundary vertices are already stored in cyclic
+        boundary-ring order by BX_boundary.py.
     """
 
     created_faces = []
 
-    if bevel_vertices is None:
-        print("[BevelX] INNER_MITER vertex caps skipped: bevel_vertices is None.")
-        return created_faces
-
-    if vertex_boundaries is None:
-        print("[BevelX] INNER_MITER vertex caps skipped: vertex_boundaries is None.")
-        return created_faces
-
     for vertex_id in sorted(vertex_boundaries.keys()):
-        if not is_inner_miter_candidate_vertex_id(
-            vertex_id=vertex_id,
-            bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries
-        ):
-            continue
-
         boundary_list = vertex_boundaries.get(vertex_id, [])
 
-        if len(boundary_list) != 4:
-            print("[BevelX] INNER_MITER vertex cap skipped for vertex {0}: expected 4 boundaries, got {1}.".format(
-                vertex_id,
-                len(boundary_list)
-            ))
-            continue
-
-        tx_ids = [
-            transaction.add_boundary_vertex(boundary_vertex)
-            for boundary_vertex in boundary_list
-        ]
-
-        faces = add_local_inner_miter_face(
-            transaction=transaction,
-            tx_ids=tx_ids,
-            source_vertex_id=vertex_id
+        cap_boundaries = get_terminal_multi_cap_boundaries(
+            boundary_list=boundary_list
         )
-
-        created_faces.extend(faces)
-
-    return created_faces
-
-def build_vertex_cap_faces(transaction, vertex_boundaries):
-    """
-    Build F_VERT cap faces from TRI_CAP boundary vertices.
-
-    Current support:
-        - one F_VERT triangle per original bevel vertex that has
-          exactly three TRI_CAP boundaries.
-    """
-
-    for vertex_id in sorted(vertex_boundaries.keys()):
-        boundary_list = vertex_boundaries.get(vertex_id, [])
-
-        cap_boundaries = [
-            boundary_vertex
-            for boundary_vertex in boundary_list
-            if getattr(boundary_vertex, "source", None) == "TRI_CAP"
-        ]
 
         if not cap_boundaries:
             continue
 
-        if len(cap_boundaries) != 3:
-            print("[BevelX] F_VERT skipped for vertex {0}: expected 3 TRI_CAP boundaries, got {1}.".format(
-                vertex_id,
-                len(cap_boundaries)
-            ))
+        if len(cap_boundaries) < 3:
+            BX_log.warn(
+                "TERMINAL_MULTI F_VERT skipped for vertex {0}: expected 3+ boundaries, got {1}.".format(
+                    vertex_id,
+                    len(cap_boundaries)
+                ),
+                channel="caps"
+            )
             continue
 
         tx_vertex_ids = [
@@ -1691,12 +2701,267 @@ def build_vertex_cap_faces(transaction, vertex_boundaries):
             for boundary_vertex in cap_boundaries
         ]
 
+        tx_vertex_ids = collapse_transaction_ids_by_position(
+            transaction=transaction,
+            tx_ids=tx_vertex_ids
+        )
+
+        if len(tx_vertex_ids) < 3:
+            BX_log.warn(
+                "TERMINAL_MULTI F_VERT skipped for vertex {0}: fewer than 3 unique cap points, verts={1}.".format(
+                    vertex_id,
+                    tx_vertex_ids
+                ),
+                channel="caps"
+            )
+            continue
+
+        expected_normal = [0.0, 0.0, 0.0]
+
+        if bm is not None:
+            expected_normal = average_original_vertex_normal(
+                bm=bm,
+                vertex_id=vertex_id
+            )
+
+        if bxm.is_zero(expected_normal):
+            points = [
+                transaction.vertices[tx_id].co_world
+                for tx_id in tx_vertex_ids
+            ]
+
+            expected_normal = calculate_polygon_normal(points)
+
+        tx_vertex_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tx_vertex_ids,
+            expected_normal=expected_normal
+        )
+
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=tx_vertex_ids
+        ):
+            BX_log.warn(
+                "TERMINAL_MULTI F_VERT skipped degenerate cap for vertex {0}: verts={1}.".format(
+                    vertex_id,
+                    tx_vertex_ids
+                ),
+                channel="caps"
+            )
+            continue
+
+        face = transaction.add_face(
+            vertex_ids=tx_vertex_ids,
+            face_kind=FACE_VERT,
+            source_face_id=None,
+            source_edge_id=None,
+            expected_normal=expected_normal
+        )
+
+        created_faces.append(face)
+
+        BX_log.warn(
+            "TERMINAL_MULTI F_VERT cap built for vertex {0}: verts={1}".format(
+                vertex_id,
+                tx_vertex_ids
+            ),
+            channel="summary"
+        )
+
+    return created_faces
+
+def is_chain_2_multi_cap_boundary_vertex(boundary_vertex):
+    return getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_CAP"
+
+
+def build_chain_2_multi_cap_faces(transaction,
+                                  vertex_boundaries,
+                                  bm=None):
+    """
+    Build F_VERT cap faces for CHAIN_2_MULTI cap groups.
+
+    Cap endpoints are aliases of existing boundaries, so transaction vertex ids
+    should be shared with the bevel strip / fallback boundary vertices.
+    """
+
+    for vertex_id in sorted(vertex_boundaries.keys()):
+        boundary_list = vertex_boundaries.get(vertex_id, [])
+
+        groups = {}
+
+        for boundary_vertex in boundary_list:
+            if not is_chain_2_multi_cap_boundary_vertex(boundary_vertex):
+                continue
+
+            role = getattr(boundary_vertex, "boundary_role", None)
+
+            if role is None:
+                continue
+
+            groups.setdefault(role, []).append(boundary_vertex)
+
+        for role in sorted(groups.keys()):
+            cap_boundaries = groups[role]
+
+            if len(cap_boundaries) < 3:
+                continue
+
+            tx_vertex_ids = [
+                transaction.add_boundary_vertex(boundary_vertex)
+                for boundary_vertex in cap_boundaries
+            ]
+
+            tx_vertex_ids = collapse_transaction_ids_by_position(
+                transaction=transaction,
+                tx_ids=tx_vertex_ids
+            )
+
+            if len(tx_vertex_ids) < 3:
+                continue
+
+            expected_normal = [0.0, 0.0, 0.0]
+
+            if bm is not None:
+                expected_normal = average_original_vertex_normal(
+                    bm=bm,
+                    vertex_id=vertex_id
+                )
+
+            if bxm.is_zero(expected_normal):
+                points = [
+                    transaction.vertices[tx_id].co_world
+                    for tx_id in tx_vertex_ids
+                ]
+
+                expected_normal = calculate_polygon_normal(points)
+
+            tx_vertex_ids = orient_transaction_face_indices_to_normal(
+                transaction=transaction,
+                face_indices=tx_vertex_ids,
+                expected_normal=expected_normal
+            )
+
+            if is_degenerate_transaction_polygon(
+                transaction=transaction,
+                vertex_ids=tx_vertex_ids
+            ):
+                continue
+
+            transaction.add_face(
+                vertex_ids=tx_vertex_ids,
+                face_kind=FACE_VERT,
+                source_face_id=None,
+                source_edge_id=None,
+                expected_normal=expected_normal
+            )
+
+            BX_log.warn(
+                "CHAIN_2_MULTI F_VERT cap built for vertex {0}, role={1}: verts={2}".format(
+                    vertex_id,
+                    role,
+                    tx_vertex_ids
+                ),
+                channel="summary"
+            )
+
+def build_vertex_cap_faces(transaction,
+                           vertex_boundaries,
+                           bm=None):
+    """
+    Build F_VERT cap faces from vertex-cap boundary vertices.
+
+    Current support:
+        - TRI_CAP: exactly 3 boundary vertices
+        - POLE_N: 4 or more boundary vertices, first simple pole cap
+
+    Important:
+        POLE_N caps must orient against the original source vertex normal,
+        not against their own calculated polygon normal. If the polygon normal
+        is used as expected_normal, flipped POLE_N ngons can never be corrected.
+    """
+
+    build_chain_2_multi_cap_faces(
+        transaction=transaction,
+        vertex_boundaries=vertex_boundaries,
+        bm=bm
+    )
+
+
+    build_terminal_multi_cap_faces(transaction=transaction,
+        vertex_boundaries=vertex_boundaries,
+        bm=bm
+    )
+    for vertex_id in sorted(vertex_boundaries.keys()):
+        boundary_list = vertex_boundaries.get(vertex_id, [])
+
+        cap_boundaries = [
+            boundary_vertex
+            for boundary_vertex in boundary_list
+            if getattr(boundary_vertex, "source", None) in ("TRI_CAP", "POLE_N")
+        ]
+
+        if not cap_boundaries:
+            continue
+
+        source = getattr(cap_boundaries[0], "source", None)
+
+        if source == "TRI_CAP" and len(cap_boundaries) != 3:
+            BX_log.warn("F_VERT skipped for vertex {0}: expected 3 TRI_CAP boundaries, got {1}.".format(
+                vertex_id,
+                len(cap_boundaries)
+            ), channel="caps")
+            continue
+
+        if source == "POLE_N" and len(cap_boundaries) < 4:
+            BX_log.warn("F_VERT skipped for vertex {0}: expected 4+ POLE_N boundaries, got {1}.".format(
+                    vertex_id, len(cap_boundaries)), channel="caps")
+            continue
+
+        tx_vertex_ids = [
+            transaction.add_boundary_vertex(boundary_vertex)
+            for boundary_vertex in cap_boundaries
+        ]
+
+        tx_vertex_ids = collapse_transaction_ids_by_position(
+            transaction=transaction,
+            tx_ids=tx_vertex_ids
+        )
+
+        if len(tx_vertex_ids) < 3:
+            BX_log.warn("F_VERT skipped for vertex {0}: fewer than 3 unique cap points, verts={1}.".format(
+                    vertex_id, tx_vertex_ids), channel="caps")
+            continue
+
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=tx_vertex_ids
+        ):
+            BX_log.debug("F_VERT skipped degenerate cap for vertex {0}: verts={1}.".format(
+                    vertex_id, tx_vertex_ids), channel="caps")
+            continue
+
         points = [
             transaction.vertices[tx_id].co_world
             for tx_id in tx_vertex_ids
         ]
 
-        expected_normal = calculate_polygon_normal(points)
+        expected_normal = [0.0, 0.0, 0.0]
+
+        if bm is not None:
+            expected_normal = average_original_vertex_normal(
+                bm=bm,
+                vertex_id=vertex_id
+            )
+
+        if bxm.is_zero(expected_normal):
+            expected_normal = calculate_polygon_normal(points)
+
+        tx_vertex_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tx_vertex_ids,
+            expected_normal=expected_normal
+        )
 
         transaction.add_face(
             vertex_ids=tx_vertex_ids,
@@ -1705,10 +2970,43 @@ def build_vertex_cap_faces(transaction, vertex_boundaries):
             expected_normal=expected_normal
         )
 
+        BX_log.debug("F_VERT cap built for vertex {0}: source={1}, verts={2}, expected_normal={3}".format(
+                vertex_id,
+                source,
+                tx_vertex_ids,
+                expected_normal
+            ),channel="caps"
+        )
+
+
 # -----------------------------------------------------------------------------
 # F_EDGE face
 # -----------------------------------------------------------------------------
+#temporary
+def debug_vertex_boundary_inventory(vertex_boundaries, vertex_id):
+    boundary_list = vertex_boundaries.get(vertex_id, [])
 
+    BX_log.warn(
+        "BOUNDARY INVENTORY vertex {0}: count={1}".format(
+            vertex_id,
+            len(boundary_list)
+        ),
+        channel="summary"
+    )
+
+    for boundary_vertex in boundary_list:
+        BX_log.warn(
+            "  id={0}, source={1}, edge={2}, face={3}, role={4}, on={5}, co={6}".format(
+                getattr(boundary_vertex, "id", None),
+                getattr(boundary_vertex, "source", None),
+                getattr(boundary_vertex, "selected_edge_id", None),
+                getattr(boundary_vertex, "face_id", None),
+                getattr(boundary_vertex, "boundary_role", None),
+                getattr(boundary_vertex, "edge_on_id", None),
+                getattr(boundary_vertex, "co_world", None)
+            ),
+            channel="summary"
+        )
 def build_edge_face(transaction, edge_data, vertex_boundaries):
     """
     Build F_EDGE bevel strip from boundary vertices.
@@ -1729,9 +3027,18 @@ def build_edge_face(transaction, edge_data, vertex_boundaries):
     bv_v1_fa = find_boundary(vertex_boundaries, edge_v1, face_a_id)
     bv_v1_fb = find_boundary(vertex_boundaries, edge_v1, face_b_id)
     bv_v0_fb = find_boundary(vertex_boundaries, edge_v0, face_b_id)
-
+    BX_log.warn(
+    "F_EDGE anchor edge {0}: v0_fa={1}, v1_fa={2}, v1_fb={3}, v0_fb={4}".format(
+        edge_id,
+        getattr(bv_v0_fa, "id", None),
+        getattr(bv_v1_fa, "id", None),
+        getattr(bv_v1_fb, "id", None),
+        getattr(bv_v0_fb, "id", None)),
+        channel="summary")
+    debug_vertex_boundary_inventory(vertex_boundaries, 64)
     if None in (bv_v0_fa, bv_v1_fa, bv_v1_fb, bv_v0_fb):
-        print("[BevelX] F_EDGE build failed: missing boundary vertex.")
+        BX_log.warn("F_EDGE build failed for edge {0}: missing boundary vertex.".format(edge_id),
+                    channel="transaction")
         return None
 
     tx_v0_fa = transaction.add_boundary_vertex(bv_v0_fa)
@@ -1895,7 +3202,8 @@ def build_reconstructed_face(transaction,
             boundary_b = find_boundary(vertex_boundaries, edge_v1, face_id)
 
             if boundary_a is None or boundary_b is None:
-                print("[BevelX] F_RECON failed: missing direct boundary for face {0}".format(face_id))
+                BX_log.warn("F_RECON failed: missing direct boundary for face {0}".format(face_id),
+                            channel="transaction")
                 return None
 
             rebuilt_tx_ids.append(transaction.add_boundary_vertex(boundary_a))
@@ -1913,7 +3221,8 @@ def build_reconstructed_face(transaction,
             boundary_b = find_boundary(vertex_boundaries, edge_v0, face_id)
 
             if boundary_a is None or boundary_b is None:
-                print("[BevelX] F_RECON failed: missing reverse boundary for face {0}".format(face_id))
+                BX_log.warn("F_RECON failed: missing reverse boundary for face {0}".format(face_id),
+                            channel="transaction")
                 return None
 
             rebuilt_tx_ids.append(transaction.add_boundary_vertex(boundary_a))
@@ -2033,10 +3342,8 @@ def build_terminal_vertex_replacement_for_face(transaction,
     )
 
     if prev_other_face is None or next_other_face is None:
-        print(
-            "[BevelX] Terminal replacement failed at vertex {0} on face {1}: "
-            "could not find neighboring faces.".format(vertex_id, face_id)
-        )
+        BX_log.debug("Terminal replacement failed at vertex {0} on face {1}: could not find neighboring faces.".format(
+                vertex_id, face_id), channel="support")
         return None
 
     boundary_prev = find_boundary(
@@ -2052,15 +3359,8 @@ def build_terminal_vertex_replacement_for_face(transaction,
     )
 
     if boundary_prev is None or boundary_next is None:
-        print(
-            "[BevelX] Terminal replacement failed at vertex {0} on face {1}: "
-            "missing boundary for neighboring faces {2}, {3}.".format(
-                vertex_id,
-                face_id,
-                prev_other_face,
-                next_other_face
-            )
-        )
+        BX_log.debug("Terminal replacement failed at vertex {0} on face {1}: missing boundary for neighboring faces {2}, {3}.".format(
+                vertex_id, face_id, prev_other_face, next_other_face), channel="support")
         return None
 
     return [
@@ -2076,11 +3376,13 @@ def find_boundary(vertex_boundaries, vertex_id, face_id):
     boundary_list = vertex_boundaries.get(vertex_id, [])
 
     for boundary_vertex in boundary_list:
+        if getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_CAP":
+            continue
+
         if boundary_vertex.face_id == face_id:
             return boundary_vertex
 
     return None
-
 
 def get_expected_bevel_face_normal(edge_data):
     normal = [0.0, 0.0, 0.0]
@@ -2163,27 +3465,6 @@ def get_affected_face_ids_for_single_edge(bm, edge_v0, edge_v1):
         affected.add(face_id)
 
     return sorted(affected)
-
-
-def face_contains_selected_edge_pair(face_vertices, edge_v0, edge_v1):
-    """
-    Return True if a face contains the selected edge as a consecutive pair.
-    """
-
-    count = len(face_vertices)
-
-    for i in range(count):
-        current_v = face_vertices[i]
-        next_v = face_vertices[(i + 1) % count]
-
-        if current_v == edge_v0 and next_v == edge_v1:
-            return True
-
-        if current_v == edge_v1 and next_v == edge_v0:
-            return True
-
-    return False
-
 
 def get_edge_id_between_vertices(bm, vertex_a, vertex_b):
     """

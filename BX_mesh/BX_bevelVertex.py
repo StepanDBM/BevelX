@@ -10,6 +10,7 @@ import math
 
 from BX_math import BX_math as bxm
 from BX_mesh import BX_edgeHalf
+from BX_profile import BX_log
 
 
 class BX_BevelVertex(object):
@@ -76,15 +77,23 @@ class BX_BevelVertex(object):
         return bv
 
     def debug_print(self):
-        print("[BevelX] BevelVertex {0}:".format(self.vertex_id))
-        print("[BevelX]   position: {0}".format(self.position))
-        print("[BevelX]   connected edges: {0}".format(self.connected_edges))
-        print("[BevelX]   selected edges: {0}".format(self.selected_edges))
-        print("[BevelX]   edge count: {0}".format(self.edge_count))
-        print("[BevelX]   selected count: {0}".format(self.selected_count))
+        """
+        Log BevelVertex diagnostics.
+        """
+
+        if not BX_log.is_enabled("DEBUG", "selection"):
+            return
+
+        BX_log.debug("BevelVertex {0}:".format(self.vertex_id), channel="selection")
+        BX_log.debug("  position: {0}".format(self.position), channel="selection")
+        BX_log.debug("  connected edges: {0}".format(self.connected_edges), channel="selection")
+        BX_log.debug("  selected edges: {0}".format(self.selected_edges), channel="selection")
+        BX_log.debug("  edge count: {0}".format(self.edge_count), channel="selection")
+        BX_log.debug("  selected count: {0}".format(self.selected_count), channel="selection")
 
         for i, edge_half in enumerate(self.edge_halves):
-            print("[BevelX]   edge_half[{0}]: {1}".format(i, edge_half))
+            BX_log.trace("  edge_half[{0}]: {1}".format(i, edge_half),
+                channel="selection")
 
 
 def elastic_bmesh_guard(bm):
@@ -134,30 +143,138 @@ def link_edge_halves_cyclic(edge_halves):
         edge_half.prev = edge_halves[(i - 1) % count].edge_id
         edge_half.next = edge_halves[(i + 1) % count].edge_id
 
-
 def sort_edges_around_vertex(bm, vertex_id, edge_ids):
     """
-    Sort connected edges around a vertex.
+    Sort connected edges around a vertex using face topology first.
 
-    This is our first approximation.
+    Topology sort:
+        - For every face touching vertex_id, find the two incident edges from edge_ids.
+        - Those two edges are adjacent around the vertex.
+        - Build a 2-neighbor ring from that adjacency.
 
-    Blender carefully orders EdgeHalves around a vertex using topology and
-    face connectivity. I start with an angle sort around an averaged vertex
-    normal, which is enough for cube tests and gives us a stable ordered ring.
+    Fallback:
+        If topology does not form a clean manifold ring, use the old angle-based sort.
     """
 
     if len(edge_ids) <= 1:
         return list(edge_ids)
 
+    edge_ids = list(edge_ids)
+    edge_set = set(edge_ids)
     vertex = bm.vertices[vertex_id]
-    origin = vertex.co_world
 
-    normal = average_vertex_normal(bm, vertex_id)
+    # -------------------------------------------------------------------------
+    # 1. Build topology adjacency between incident edges.
+    # -------------------------------------------------------------------------
+
+    adjacency = {}
+
+    for edge_id in edge_ids:
+        adjacency[edge_id] = []
+
+    for face_id in vertex.faces:
+        face = bm.faces[face_id]
+        incident_face_edges = []
+
+        for face_edge_id in face.edges:
+            if face_edge_id not in edge_set:
+                continue
+
+            edge = bm.edges[face_edge_id]
+
+            if edge.other_vertex(vertex_id) is None:
+                continue
+
+            incident_face_edges.append(face_edge_id)
+
+        if len(incident_face_edges) != 2:
+            continue
+
+        edge_a = incident_face_edges[0]
+        edge_b = incident_face_edges[1]
+
+        if edge_b not in adjacency[edge_a]:
+            adjacency[edge_a].append(edge_b)
+
+        if edge_a not in adjacency[edge_b]:
+            adjacency[edge_b].append(edge_a)
+
+    # -------------------------------------------------------------------------
+    # 2. Try to walk a clean manifold ring.
+    # -------------------------------------------------------------------------
+
+    can_topology_sort = True
+
+    for edge_id in edge_ids:
+        if len(adjacency.get(edge_id, [])) != 2:
+            can_topology_sort = False
+            break
+
+    if can_topology_sort:
+        start_edge = edge_ids[0]
+        ordered = None
+
+        # Either neighbor can be the next edge depending on winding direction.
+        # Try both and accept the first clean closed ring.
+        for first_neighbor in adjacency[start_edge]:
+            trial_order = [
+                start_edge,
+                first_neighbor
+            ]
+
+            previous_edge = start_edge
+            current_edge = first_neighbor
+            valid_walk = True
+
+            while len(trial_order) < len(edge_ids):
+                next_edge = None
+
+                for candidate_edge in adjacency[current_edge]:
+                    if candidate_edge != previous_edge:
+                        next_edge = candidate_edge
+                        break
+
+                if next_edge is None:
+                    valid_walk = False
+                    break
+
+                if next_edge in trial_order:
+                    valid_walk = False
+                    break
+
+                trial_order.append(next_edge)
+
+                previous_edge = current_edge
+                current_edge = next_edge
+
+            if not valid_walk:
+                continue
+
+            last_edge = trial_order[-1]
+
+            if start_edge not in adjacency[last_edge]:
+                continue
+
+            ordered = trial_order
+            break
+
+        if ordered is not None:
+            return ordered
+
+    # -------------------------------------------------------------------------
+    # 3. Fallback: old angle sort.
+    # -------------------------------------------------------------------------
+
+    normal = average_vertex_normal(
+        bm=bm,
+        vertex_id=vertex_id
+    )
 
     if bxm.is_zero(normal):
         return list(edge_ids)
 
     reference_edge_id = edge_ids[0]
+
     reference_vector = edge_vector_from_vertex(
         bm=elastic_bmesh_guard(bm),
         edge_id=reference_edge_id,
@@ -194,6 +311,56 @@ def sort_edges_around_vertex(bm, vertex_id, edge_ids):
         for angle, edge_id in scored
     ]
 
+
+    # -------------------------------------------------------------------------
+    # 3. Fallback: old angle sort.
+    # -------------------------------------------------------------------------
+
+    normal = average_vertex_normal(
+        bm=bm,
+        vertex_id=vertex_id
+    )
+
+    if bxm.is_zero(normal):
+        return list(edge_ids)
+
+    reference_edge_id = edge_ids[0]
+
+    reference_vector = edge_vector_from_vertex(
+        bm=elastic_bmesh_guard(bm),
+        edge_id=reference_edge_id,
+        vertex_id=vertex_id
+    )
+
+    if bxm.is_zero(reference_vector):
+        return list(edge_ids)
+
+    scored = []
+
+    for edge_id in edge_ids:
+        vector = edge_vector_from_vertex(
+            bm=elastic_bmesh_guard(bm),
+            edge_id=edge_id,
+            vertex_id=vertex_id
+        )
+
+        angle = bxm.signed_angle_around_normal(
+            reference_vector,
+            vector,
+            normal
+        )
+
+        if angle < 0.0:
+            angle += math.pi * 2.0
+
+        scored.append((angle, edge_id))
+
+    scored.sort(key=lambda item: item[0])
+
+    return [
+        edge_id
+        for angle, edge_id in scored
+    ]
 
 def average_vertex_normal(bm, vertex_id):
     """
@@ -261,10 +428,13 @@ def build_bevel_vertices_from_bmesh(bm):
 
 def debug_print_bevel_vertices(bevel_vertices):
     """
-    Print bevel vertex diagnostics.
+    Log bevel vertex diagnostics.
     """
+    if not BX_log.is_enabled("DEBUG", "selection"):
+        return
 
-    print("[BevelX] BevelVertex count: {0}".format(len(bevel_vertices)))
+    BX_log.debug("BevelVertex count: {0}".format(len(bevel_vertices)),
+        channel="selection")
 
     for vertex_id in sorted(bevel_vertices.keys()):
         bevel_vertices[vertex_id].debug_print()

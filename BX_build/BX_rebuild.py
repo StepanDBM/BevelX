@@ -1,8 +1,4 @@
 # BX_rebuild.py
-# BevelX face rebuild helpers.
-#
-# This module owns topology reconstruction logic.
-# It should not create Maya nodes directly.
 
 from __future__ import print_function
 
@@ -12,62 +8,6 @@ from BX_math import BX_math as bxm
 # -----------------------------------------------------------------------------
 # Affected face rebuilding
 # -----------------------------------------------------------------------------
-
-def rebuild_face_with_rail(face_vertices,
-                           edge_v0,
-                           edge_v1,
-                           rail_vertex_map,
-                           original_vertex_map):
-    """
-    Replace the selected edge inside one face with the face's rail vertices.
-
-    If the face contains edge_v0 -> edge_v1:
-        replace with rail_v0 -> rail_v1
-
-    If the face contains edge_v1 -> edge_v0:
-        replace with rail_v1 -> rail_v0
-    """
-
-    if len(face_vertices) < 3:
-        return None
-
-    rotated = rotate_face_so_edge_is_not_wrapped(
-        face_vertices,
-        edge_v0,
-        edge_v1
-    )
-
-    if rotated is None:
-        return None
-
-    result = []
-    count = len(rotated)
-    i = 0
-
-    while i < count:
-        current_v = rotated[i]
-        next_v = rotated[(i + 1) % count]
-
-        if current_v == edge_v0 and next_v == edge_v1:
-            result.append(rail_vertex_map[edge_v0])
-            result.append(rail_vertex_map[edge_v1])
-            i += 2
-            continue
-
-        if current_v == edge_v1 and next_v == edge_v0:
-            result.append(rail_vertex_map[edge_v1])
-            result.append(rail_vertex_map[edge_v0])
-            i += 2
-            continue
-
-        result.append(original_vertex_map[current_v])
-        i += 1
-
-    if len(result) < 3:
-        return None
-
-    return result
-
 
 def rotate_face_so_edge_is_not_wrapped(face_vertices, edge_v0, edge_v1):
     """
@@ -98,43 +38,6 @@ def rotate_face_so_edge_is_not_wrapped(face_vertices, edge_v0, edge_v1):
 # -----------------------------------------------------------------------------
 # Bevel face construction
 # -----------------------------------------------------------------------------
-
-def build_bevel_face_indices(edge_data, rails, rail_vertex_ids, points):
-    """
-    Build the bevel quad face between the two rails.
-
-    The face is oriented using the sum of adjacent face normals.
-    """
-
-    if len(rails) != 2:
-        return None
-
-    face_a_id = rails[0]["face_id"]
-    face_b_id = rails[1]["face_id"]
-
-    edge_v0, edge_v1 = edge_data["vertex_ids"]
-
-    a0 = rail_vertex_ids[face_a_id][edge_v0]
-    a1 = rail_vertex_ids[face_a_id][edge_v1]
-    b0 = rail_vertex_ids[face_b_id][edge_v0]
-    b1 = rail_vertex_ids[face_b_id][edge_v1]
-
-    face_indices = [
-        a0,
-        a1,
-        b1,
-        b0,
-    ]
-
-    expected_normal = get_expected_bevel_normal(rails)
-
-    return orient_face_indices_to_normal(
-        face_indices,
-        points,
-        expected_normal
-    )
-
-
 def get_expected_bevel_normal(rails):
     """
     Estimate expected bevel face normal from adjacent face normals.

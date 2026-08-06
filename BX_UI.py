@@ -95,29 +95,18 @@ class BevelXUI(QtWidgets.QDialog):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        main_layout.addWidget(self._build_header_group())
         main_layout.addWidget(self._build_affect_group())
         main_layout.addWidget(self._build_width_group())
         main_layout.addWidget(self._build_geometry_group())
         main_layout.addWidget(self._build_profile_group())
         main_layout.addWidget(self._build_miter_group())
+        main_layout.addWidget(self._build_cap_group())
+        main_layout.addWidget(self._build_options_group())
         main_layout.addWidget(self._build_options_group())
         main_layout.addLayout(self._build_action_buttons())
 
         main_layout.addStretch()
-
-    def _build_header_group(self):
-        group = QtWidgets.QGroupBox("BevelX")
-        layout = QtWidgets.QVBoxLayout(group)
-
-        label_a = QtWidgets.QLabel("Bx prototype: Qt UI -> settings -> core callbacks")
-        label_b = QtWidgets.QLabel("No Maya polyBevel calls. Backend is ours.")
-
-        layout.addWidget(label_a)
-        layout.addWidget(label_b)
-
-        return group
-
+        
     def _build_affect_group(self):
         group = QtWidgets.QGroupBox("Affect")
         layout = QtWidgets.QHBoxLayout(group)
@@ -330,6 +319,39 @@ class BevelXUI(QtWidgets.QDialog):
         layout.addRow("Inner", self.miter_inner_combo)
 
         return group
+    def _build_cap_group(self):
+        group = QtWidgets.QGroupBox("Caps")
+        layout = QtWidgets.QFormLayout(group)
+
+        self.inner_cap_combo = QtWidgets.QComboBox()
+        self.inner_cap_combo.addItems([
+            "Auto",
+            "Ngon",
+            "Fan",
+            "ADJ Lite",
+        ])
+
+        self.pole_cap_combo = QtWidgets.QComboBox()
+        self.pole_cap_combo.addItems([
+            "Auto",
+            "Ngon",
+            "Fan",
+            "ADJ Lite",
+        ])
+
+        self.inner_cap_combo.setToolTip(
+            "How BevelX fills complex all-boundary inner caps."
+        )
+
+        self.pole_cap_combo.setToolTip(
+            "How BevelX fills selected_count >= 4 pole vertex caps. "
+            "ADJ Lite is reserved for the next pole implementation pass."
+        )
+
+        layout.addRow("Inner Cap", self.inner_cap_combo)
+        layout.addRow("Pole Cap", self.pole_cap_combo)
+
+        return group
 
     def _build_options_group(self):
         group = QtWidgets.QGroupBox("Options")
@@ -438,6 +460,27 @@ class BevelXUI(QtWidgets.QDialog):
                 BX_settings.MITER_ARC: "Arc",
             }
         )
+        self._set_combo_by_constant(
+            self.inner_cap_combo,
+            settings.get("inner_cap_mode", BX_settings.INNER_CAP_AUTO),
+            {
+                BX_settings.INNER_CAP_AUTO: "Auto",
+                BX_settings.INNER_CAP_NGON: "Ngon",
+                BX_settings.INNER_CAP_FAN: "Fan",
+                BX_settings.INNER_CAP_ADJ_LITE: "ADJ Lite",
+            }
+        )
+
+        self._set_combo_by_constant(
+            self.pole_cap_combo,
+            settings.get("pole_cap_mode", BX_settings.POLE_CAP_AUTO),
+            {
+                BX_settings.POLE_CAP_AUTO: "Auto",
+                BX_settings.POLE_CAP_NGON: "Ngon",
+                BX_settings.POLE_CAP_FAN: "Fan",
+                BX_settings.POLE_CAP_ADJ_LITE: "ADJ Lite",
+            }
+        )
 
         self.clamp_overlap_check.setChecked(bool(settings["clamp_overlap"]))
         self.loop_slide_check.setChecked(bool(settings["loop_slide"]))
@@ -491,6 +534,15 @@ class BevelXUI(QtWidgets.QDialog):
         settings["profile_shape"] = float(self.profile_shape_spin.value())
         settings["profile_preset"] = self.profile_preset_combo.currentText()
 
+        settings["miter_inner"] = self._label_to_constant(
+            self.miter_inner_combo.currentText(),
+            {
+                "Sharp": BX_settings.MITER_SHARP,
+                "Patch": BX_settings.MITER_PATCH,
+                "Arc": BX_settings.MITER_ARC,
+            }
+        )
+
         settings["miter_outer"] = self._label_to_constant(
             self.miter_outer_combo.currentText(),
             {
@@ -500,12 +552,23 @@ class BevelXUI(QtWidgets.QDialog):
             }
         )
 
-        settings["miter_inner"] = self._label_to_constant(
-            self.miter_inner_combo.currentText(),
+        settings["inner_cap_mode"] = self._label_to_constant(
+            self.inner_cap_combo.currentText(),
             {
-                "Sharp": BX_settings.MITER_SHARP,
-                "Patch": BX_settings.MITER_PATCH,
-                "Arc": BX_settings.MITER_ARC,
+                "Auto": BX_settings.INNER_CAP_AUTO,
+                "Ngon": BX_settings.INNER_CAP_NGON,
+                "Fan": BX_settings.INNER_CAP_FAN,
+                "ADJ Lite": BX_settings.INNER_CAP_ADJ_LITE,
+            }
+        )
+
+        settings["pole_cap_mode"] = self._label_to_constant(
+            self.pole_cap_combo.currentText(),
+            {
+                "Auto": BX_settings.POLE_CAP_AUTO,
+                "Ngon": BX_settings.POLE_CAP_NGON,
+                "Fan": BX_settings.POLE_CAP_FAN,
+                "ADJ Lite": BX_settings.POLE_CAP_ADJ_LITE,
             }
         )
 
@@ -535,6 +598,9 @@ class BevelXUI(QtWidgets.QDialog):
 
         self.width_type_combo.currentIndexChanged.connect(self.schedule_update_preview)
         self.debug_draw_check.stateChanged.connect(self.schedule_update_preview)
+
+        self.inner_cap_combo.currentIndexChanged.connect(self.schedule_update_preview)
+        self.pole_cap_combo.currentIndexChanged.connect(self.schedule_update_preview)
 
     def on_width_spin_changed(self, value):
         """

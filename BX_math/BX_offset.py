@@ -1,17 +1,4 @@
 # BX_offset.py
-# BevelX offset math.
-#
-# This module is Maya-independent.
-# It works with points/vectors only.
-#
-# The first target is not full bevel solving.
-# The first target is:
-#
-#   selected edge
-#   adjacent face plane
-#   offset points / rails
-#
-# Once this works, BX_boundary can consume it.
 
 from __future__ import print_function
 
