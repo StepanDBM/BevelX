@@ -9,10 +9,13 @@ from BX_profile import BX_log
 FACE_ORIG = "F_ORIG"
 FACE_EDGE = "F_EDGE"
 FACE_VERT = "F_VERT"
-FACE_CAP = "F_CAP"
-FACE_PATCH = "F_PATCH"
-FACE_INNER_MITER_PATCH = "F_INNER_MITER_PATCH"
 FACE_RECON = "F_RECON"
+
+ALLOWED_BEVEL_FACE_KINDS = set([
+    FACE_EDGE,
+    FACE_VERT,
+    FACE_RECON,
+])
 
 VERT_ORIGINAL = "ORIGINAL"
 VERT_BOUNDARY = "BOUNDARY"
@@ -116,7 +119,7 @@ class BX_BevelTransaction(object):
         self.original_vertex_id_to_tx_id = {}
         self.boundary_id_to_tx_id = {}
 
-        self.faces_to_replace = []
+        self.faces_to_replace = set()
 
         self.inner_miter_local_cap_keys = set()
 
@@ -193,7 +196,6 @@ class BX_BevelTransaction(object):
         Add a generated transaction vertex.
 
         Used for:
-            - F_CAP fan centers
             - future F_PATCH center points
             - future VMesh generated vertices
         """
@@ -240,6 +242,25 @@ class BX_BevelTransaction(object):
             self.vertices[vertex_id].co_world
             for vertex_id in face.vertex_ids
         ]
+
+    def add_face_to_replace(self, face_id):
+        """
+        Mark one original Maya source face for deletion/replacement.
+        """
+
+        if face_id is None:
+            return
+
+        self.faces_to_replace.add(int(face_id))
+
+
+    def add_faces_to_replace(self, face_ids):
+        """
+        Mark many original Maya source faces for deletion/replacement.
+        """
+
+        for face_id in face_ids or []:
+            self.add_face_to_replace(face_id)
 
     # -------------------------------------------------------------------------
     # Debug
@@ -288,6 +309,73 @@ class BX_BevelTransaction(object):
 # -----------------------------------------------------------------------------
 # Transaction construction
 # -----------------------------------------------------------------------------
+def add_bevel_face(transaction,
+                   vertex_ids,
+                   face_kind,
+                   source_face_id=None,
+                   source_edge_id=None,
+                   expected_normal=None,
+                   debug_label=None):
+    """
+    Blender-style face creation gate for BevelX.
+
+    All generated bevel topology should go through this helper.
+
+    Allowed output kinds:
+        F_EDGE   -> bevel strip along one selected edge
+        F_VERT   -> vertex / VMesh region
+        F_RECON  -> reconstructed original source face
+
+    Do not generate F_CAP / F_PATCH / INNER_MITER_PATCH here.
+    """
+
+    if face_kind not in ALLOWED_BEVEL_FACE_KINDS:
+        raise RuntimeError(
+            "Non-Blender bevel face kind blocked: {0}, label={1}, verts={2}".format(
+                face_kind,
+                debug_label,
+                vertex_ids
+            )
+        )
+
+    if not vertex_ids or len(vertex_ids) < 3:
+        BX_log.warn(
+            "add_bevel_face skipped: fewer than 3 verts, kind={0}, label={1}, verts={2}".format(
+                face_kind,
+                debug_label,
+                vertex_ids
+            ),
+            channel="summary"
+        )
+        return None
+
+    if face_kind == FACE_RECON and source_face_id is None:
+        raise RuntimeError(
+            "F_RECON must carry source_face_id, label={0}, verts={1}".format(
+                debug_label,
+                vertex_ids
+            )
+        )
+
+    face_id = transaction.add_face(
+        vertex_ids=vertex_ids,
+        face_kind=face_kind,
+        source_face_id=source_face_id,
+        source_edge_id=source_edge_id,
+        expected_normal=expected_normal
+    )
+
+    # Maya-side equivalent of Blender replacing affected original topology.
+    # This is safe even if affected faces are already marked earlier.
+    if face_kind == FACE_RECON and source_face_id is not None:
+        if hasattr(transaction, "add_face_to_replace"):
+            transaction.add_face_to_replace(source_face_id)
+
+    return face_id
+
+# -----------------------------------------------------------------------------
+# Transaction construction
+# -----------------------------------------------------------------------------
 def transaction_has_terminal_multi_boundaries(vertex_boundaries):
     """
     Return True if any original vertex has TERMINAL_MULTI boundary data.
@@ -313,6 +401,28 @@ def vertex_has_terminal_multi_boundaries(vertex_boundaries, vertex_id):
             return True
 
     return False
+
+def get_selected_edge_ids_from_edges_data(edges_data):
+    return set(
+        edge_data["edge_id"]
+        for edge_data in edges_data
+    )
+
+def face_edges_are_all_selected(bm, face_id, selected_edge_ids):
+    """
+    Return True when every edge of source face face_id is selected.
+    """
+
+    face_edges = list(bm.faces[face_id].edges)
+
+    if not face_edges:
+        return False
+
+    for edge_id in face_edges:
+        if edge_id not in selected_edge_ids:
+            return False
+
+    return True
 
 def build_single_edge_transaction(edge_data,
                                   vertex_boundaries,
@@ -368,7 +478,7 @@ def build_single_edge_transaction(edge_data,
     )
 
     if bm is None:
-        transaction.faces_to_replace = list(adjacent_face_ids)
+        transaction.add_faces_to_replace(adjacent_face_ids)
 
         BX_log.warn("Transaction warning: bm is None, only F_EDGE was built.",
                     channel="transaction")
@@ -380,7 +490,7 @@ def build_single_edge_transaction(edge_data,
         edge_v1=edge_v1
     )
 
-    transaction.faces_to_replace = affected_face_ids
+    transaction.add_faces_to_replace(affected_face_ids)
 
     for face_id in affected_face_ids:
         build_reconstructed_face(
@@ -497,14 +607,6 @@ def build_selection_transaction(edges_data,
         vertex_boundaries=vertex_boundaries,
         bm=bm
     )
-    # 2b. Build CORNER2 miter triangles.
-    # These fill the 3-boundary bend vertices in C/U shaped selections.
-    build_corner2_miter_faces(
-        transaction=transaction,
-        vertex_boundaries=vertex_boundaries,
-        bm=bm,
-        bevel_vertices=bevel_vertices
-    )
 
     debug_inner_miter_candidates(
         bevel_vertices=bevel_vertices,
@@ -514,19 +616,15 @@ def build_selection_transaction(edges_data,
     if bm is None:
         return transaction
 
-    affected_vertex_ids = get_affected_vertex_ids_for_selected_edges(
-        edges_data
-    )
+    affected_face_ids = get_affected_face_ids_for_selected_edges(bm=bm, edges_data=edges_data)
 
-    affected_face_ids = get_affected_face_ids_for_selected_edges(
-        bm=bm,
-        edges_data=edges_data
-    )
+    transaction.add_faces_to_replace(affected_face_ids)
+    BX_log.warn("SOURCE faces marked for replacement: count={0}, faces={1}".format(
+            len(affected_face_ids), sorted(list(affected_face_ids))), channel="summary")
+    
+    affected_vertex_ids = get_affected_vertex_ids_for_selected_edges(edges_data)
 
-    transaction.faces_to_replace = affected_face_ids
-
-    # 3. Rebuild every original face touched by affected vertices.
-    for face_id in affected_face_ids:
+    for face_id in sorted(affected_face_ids):
         build_reconstructed_face_for_selection(
             transaction=transaction,
             bm=bm,
@@ -803,6 +901,56 @@ def debug_inner_miter_candidates(bevel_vertices,
         "INNER_MITER candidate debug found {0} candidates.".format(found),
         channel="miter"
     )
+#######################################################
+# Sector / CHAIN_2_MULTI gap boundary helpers
+#######################################################
+def is_sector_boundary_vertex(boundary_vertex):
+    return getattr(boundary_vertex, "source", None) in (
+        "SECTOR_BOUNDARY",
+    )
+
+def vertex_has_sector_boundaries(vertex_boundaries, vertex_id):
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    for boundary_vertex in boundary_list:
+        if is_sector_boundary_vertex(boundary_vertex):
+            return True
+
+    return False
+
+def find_sector_boundary_for_face_edge(vertex_boundaries,
+                                       vertex_id,
+                                       edge_id,
+                                       face_id):
+    """
+    Find sector boundary for one incident edge at one original vertex.
+
+    Works for:
+        selected edge side aliases:
+            selected_edge_id == edge_id and face_id == face_id
+
+        middle edge aliases:
+            edge_on_id == edge_id
+    """
+
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    for boundary_vertex in boundary_list:
+        if not is_sector_boundary_vertex(boundary_vertex):
+            continue
+
+        if getattr(boundary_vertex, "selected_edge_id", None) == edge_id:
+            if getattr(boundary_vertex, "face_id", None) == face_id:
+                return boundary_vertex
+
+    for boundary_vertex in boundary_list:
+        if not is_sector_boundary_vertex(boundary_vertex):
+            continue
+
+        if getattr(boundary_vertex, "edge_on_id", None) == edge_id:
+            return boundary_vertex
+
+    return None
 
 #######################################################
 # just for now, I really am unsure of this values. debug print shows BX_BoundaryVertex(... face=44 ...), so...
@@ -819,70 +967,6 @@ def boundary_vertex_face_id(boundary_vertex):
         return boundary_vertex.face
 
     return None
-
-def should_build_inner_cap_face(transaction, face_indices):
-    """
-    Return True if a rebuilt source face should become an inner cap.
-
-    First conservative rule:
-        - rebuilt face has 6 or more vertices
-        - all rebuilt vertices are boundary vertices
-
-    This avoids changing normal outer support faces that still contain
-    original corner vertices.
-    """
-
-    if len(face_indices) < 6:
-        return False
-
-    for tx_id in face_indices:
-        tx_vertex = transaction.vertices[tx_id]
-
-        if tx_vertex.source != VERT_BOUNDARY:
-            return False
-
-    return True
-
-
-def build_inner_cap_face(transaction, bm, face_id, face_indices):
-    """
-    Build a simple F_CAP polygon for a complex all-boundary reconstructed face.
-
-    This is the first INNER_CAP_NONE / M_POLY_CAP behavior:
-        - collect all boundary vertices from the rebuilt face
-        - sort them around the original source face center
-        - orient to the original source face normal
-        - add one F_CAP polygon
-
-    This is intentionally simple and predictable. Later Auto mode can
-    replace this with rail-intersection patching.
-    """
-
-    face = bm.faces[face_id]
-
-    expected_normal = list(face.normal_world)
-    face_center = list(face.center_world)
-
-    sorted_indices = sort_transaction_vertices_on_face(
-        transaction=transaction,
-        vertex_ids=face_indices,
-        face_center=face_center,
-        face_normal=expected_normal
-    )
-
-    sorted_indices = orient_transaction_face_indices_to_normal(
-        transaction=transaction,
-        face_indices=sorted_indices,
-        expected_normal=expected_normal
-    )
-
-    return transaction.add_face(
-        vertex_ids=sorted_indices,
-        face_kind=FACE_CAP,
-        source_face_id=face_id,
-        expected_normal=expected_normal
-    )
-
 
 def sort_transaction_vertices_on_face(transaction,
                                       vertex_ids,
@@ -948,67 +1032,28 @@ def make_fallback_tangent(normal):
 
     return bxm.normalize(tangent)
 
-def vertex_has_chain_2_multi_gap_boundaries(vertex_boundaries, vertex_id):
-    boundary_list = vertex_boundaries.get(vertex_id, [])
-
-    for boundary_vertex in boundary_list:
-        if getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_GAP":
-            return True
-
-    return False
-
-def find_chain_2_multi_gap_boundary_for_face_edge(vertex_boundaries,
-                                                  vertex_id,
-                                                  edge_id,
-                                                  face_id):
+def build_sector_face_vertex_replacement(transaction,
+                                         bm,
+                                         face_id,
+                                         face_vertices,
+                                         vertex_index,
+                                         vertex_id,
+                                         vertex_boundaries):
     """
-    Find the shared gap boundary for edge_id at vertex_id.
+    Replace one affected original vertex in one F_RECON source face using
+    sector / BoundVert-style boundaries.
 
-    Works for:
-        - selected edge side aliases, matched by selected_edge_id + face_id
-        - middle edge aliases, matched by edge_on_id
-    """
+    Blender-style idea:
+        Source face contains:
+            prev_v -> vertex_id -> next_v
 
-    boundary_list = vertex_boundaries.get(vertex_id, [])
+        Replacement uses:
+            sector boundary attached to edge(prev_v, vertex_id)
+            sector boundary attached to edge(vertex_id, next_v)
 
-    # First: exact selected-edge face alias.
-    for boundary_vertex in boundary_list:
-        if getattr(boundary_vertex, "source", None) != "CHAIN_2_MULTI_GAP":
-            continue
-
-        if getattr(boundary_vertex, "selected_edge_id", None) == edge_id:
-            if getattr(boundary_vertex, "face_id", None) == face_id:
-                return boundary_vertex
-
-    # Second: middle/non-selected edge alias.
-    for boundary_vertex in boundary_list:
-        if getattr(boundary_vertex, "source", None) != "CHAIN_2_MULTI_GAP":
-            continue
-
-        if getattr(boundary_vertex, "edge_on_id", None) == edge_id:
-            return boundary_vertex
-
-    return None
-
-def build_chain_2_multi_gap_face_vertex_replacement(transaction,
-                                                    bm,
-                                                    face_id,
-                                                    face_vertices,
-                                                    vertex_index,
-                                                    vertex_id,
-                                                    vertex_boundaries):
-    """
-    Replace a high-valence CHAIN_2_MULTI vertex using gap aliases.
-
-    Source face:
-        prev_v -> vertex_id -> next_v
-
-    Replacement:
-        gap boundary for prev edge
-        gap boundary for next edge
-
-    If both edges map to the same gap boundary, collapse to one tx vertex.
-    That is expected and Blender-like.
+    If both incident face edges map to the same sector boundary, the result
+    collapses to one tx vertex. That is expected for support faces inside
+    one sector.
     """
 
     count = len(face_vertices)
@@ -1028,14 +1073,28 @@ def build_chain_2_multi_gap_face_vertex_replacement(transaction,
         vertex_b=next_v
     )
 
-    boundary_prev = find_chain_2_multi_gap_boundary_for_face_edge(
+    if prev_edge_id is None or next_edge_id is None:
+        BX_log.warn(
+            "SECTOR replacement failed at vertex {0} on face {1}: missing incident edge, prev_v={2}, next_v={3}, prev_edge={4}, next_edge={5}".format(
+                vertex_id,
+                face_id,
+                prev_v,
+                next_v,
+                prev_edge_id,
+                next_edge_id
+            ),
+            channel="summary"
+        )
+        return None
+
+    boundary_prev = find_sector_boundary_for_face_edge(
         vertex_boundaries=vertex_boundaries,
         vertex_id=vertex_id,
         edge_id=prev_edge_id,
         face_id=face_id
     )
 
-    boundary_next = find_chain_2_multi_gap_boundary_for_face_edge(
+    boundary_next = find_sector_boundary_for_face_edge(
         vertex_boundaries=vertex_boundaries,
         vertex_id=vertex_id,
         edge_id=next_edge_id,
@@ -1044,7 +1103,7 @@ def build_chain_2_multi_gap_face_vertex_replacement(transaction,
 
     if boundary_prev is None or boundary_next is None:
         BX_log.warn(
-            "CHAIN_2_MULTI GAP replacement failed at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}".format(
+            "SECTOR replacement failed at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}".format(
                 vertex_id,
                 face_id,
                 prev_edge_id,
@@ -1074,10 +1133,17 @@ def build_chain_2_multi_gap_face_vertex_replacement(transaction,
     )
 
     if not tx_ids:
+        BX_log.warn(
+            "SECTOR replacement failed at vertex {0} on face {1}: collapsed to no vertices.".format(
+                vertex_id,
+                face_id
+            ),
+            channel="summary"
+        )
         return None
 
     BX_log.warn(
-        "CHAIN_2_MULTI GAP replacement at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}, tx={6}".format(
+        "SECTOR replacement at vertex {0} on face {1}: prev_edge={2}, next_edge={3}, boundary_prev={4}, boundary_next={5}, tx={6}".format(
             vertex_id,
             face_id,
             prev_edge_id,
@@ -1091,6 +1157,78 @@ def build_chain_2_multi_gap_face_vertex_replacement(transaction,
 
     return tx_ids
 
+def build_direct_face_loop_reconstruction(transaction,
+                                          bm,
+                                          face_id,
+                                          vertex_boundaries):
+    """
+    Blender-style source-face rebuild.
+
+    If every vertex of the original face has a boundary vertex for this
+    source face, rebuild the source face directly in original face-loop order.
+
+    """
+
+    face_vertices = list(bm.faces[face_id].vertices)
+
+    tx_ids = []
+
+    for vertex_id in face_vertices:
+        boundary_vertex = find_boundary(
+            vertex_boundaries=vertex_boundaries,
+            vertex_id=vertex_id,
+            face_id=face_id
+        )
+
+        if boundary_vertex is None:
+            return False
+
+        tx_ids.append(
+            transaction.add_boundary_vertex(boundary_vertex)
+        )
+
+    tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=tx_ids
+    )
+
+    if len(tx_ids) < 3:
+        return False
+
+    expected_normal = bm.faces[face_id].normal_world
+
+    tx_ids = orient_transaction_face_indices_to_normal(
+        transaction=transaction,
+        face_indices=tx_ids,
+        expected_normal=expected_normal
+    )
+
+    if is_degenerate_transaction_polygon(
+        transaction=transaction,
+        vertex_ids=tx_ids
+    ):
+        return False
+
+    add_bevel_face(
+        transaction=transaction,
+        vertex_ids=tx_ids,
+        face_kind=FACE_RECON,
+        source_face_id=face_id,
+        source_edge_id=None,
+        expected_normal=expected_normal,
+        debug_label="DIRECT_FACE_RECON face {0}".format(face_id)
+    )
+
+    BX_log.warn(
+        "DIRECT_FACE_RECON built for face {0}: verts={1}".format(
+            face_id,
+            tx_ids
+        ),
+        channel="summary"
+    )
+
+    return True
+
 def build_reconstructed_face_for_selection(transaction,
                                            bm,
                                            face_id,
@@ -1101,17 +1239,32 @@ def build_reconstructed_face_for_selection(transaction,
     """
     Build F_RECON for a face affected by a selected edge set.
 
-    Stable 2.0 rule:
-        If an affected vertex has a boundary vertex directly associated
-        with this face, use it.
+    Blender-style rule:
+        First try to rebuild the original source face directly from
+        face-owned boundary vertices in original face-loop order.
 
-    TERMINAL_MULTI addition:
-        Only if there is no direct boundary for this face, try the
-        TERMINAL_MULTI two-point support replacement.
+    If that does not work:
+        Rebuild the source face by walking the original face loop and replacing
+        affected vertices with the appropriate boundary/sector/terminal support
+        vertices.
 
-    This prevents selected-edge source faces from intruding over the F_EDGE
-    bevel strip.
+    No F_CAP / F_PATCH / ADJ_LITE ownership should happen here.
     """
+
+    # ------------------------------------------------------------
+    # Blender-style direct face-loop reconstruction.
+    #
+    # If every loop vertex has a face-owned boundary for this face,
+    # the whole original face can be rebuilt directly as F_RECON.
+    #
+    # ------------------------------------------------------------
+    if build_direct_face_loop_reconstruction(
+        transaction=transaction,
+        bm=bm,
+        face_id=face_id,
+        vertex_boundaries=vertex_boundaries
+    ):
+        return True
 
     face = bm.faces[face_id]
     face_vertices = list(face.vertices)
@@ -1136,12 +1289,8 @@ def build_reconstructed_face_for_selection(transaction,
         # Direct face-owned boundary.
         #
         # This MUST remain first.
-        #
-        # For faces that directly contain the selected edge, this gives
-        # the selected-edge rail point for this source face.
-        #
-        # If TERMINAL_MULTI runs before this, F_RECON can intrude over
-        # the F_EDGE bevel strip.
+        # Faces that directly own boundary points should consume those
+        # boundary points before terminal/sector support replacement runs.
         # ------------------------------------------------------------
         direct_boundary = find_boundary(
             vertex_boundaries,
@@ -1156,18 +1305,14 @@ def build_reconstructed_face_for_selection(transaction,
             continue
 
         # ------------------------------------------------------------
-        # CHAIN_2_MULTI gap-boundary replacement.
-        #
-        # This must run before legacy support replacement.
-        # Legacy support replacement crosses to neighboring selected-edge
-        # anchors and creates skinny strips at high-valence pass-through
-        # vertices.
+        # Case B:
+        # Sector / BoundVert replacement.
         # ------------------------------------------------------------
-        if vertex_has_chain_2_multi_gap_boundaries(
+        if vertex_has_sector_boundaries(
             vertex_boundaries=vertex_boundaries,
             vertex_id=current_v
         ):
-            replacement_ids = build_chain_2_multi_gap_face_vertex_replacement(
+            replacement_ids = build_sector_face_vertex_replacement(
                 transaction=transaction,
                 bm=bm,
                 face_id=face_id,
@@ -1182,15 +1327,8 @@ def build_reconstructed_face_for_selection(transaction,
                 continue
 
         # ------------------------------------------------------------
-        # Case B:
+        # Case C:
         # TERMINAL_MULTI support-face replacement.
-        #
-        # This only runs when the current source face does NOT directly
-        # own a boundary point for this affected vertex.
-        #
-        # In other words:
-        #     selected-edge adjacent faces use direct_boundary
-        #     support faces use two terminal-multi boundary points
         # ------------------------------------------------------------
         if vertex_has_terminal_multi_boundaries(
             vertex_boundaries=vertex_boundaries,
@@ -1218,18 +1356,12 @@ def build_reconstructed_face_for_selection(transaction,
             )
 
         # ------------------------------------------------------------
-        # Case C:
-        # Legacy 2.0 support-face replacement.
+        # Case D:
+        # Legacy support-face replacement.
+        #
+        # Keep temporarily until all support replacement is folded into
+        # direct F_RECON / sector replacement.
         # ------------------------------------------------------------
-        if current_v == 64:
-            BX_log.warn(
-                "F_RECON inspect vertex 64 on face {0}: face_vertices={1}".format(
-                    face_id,
-                    face_vertices
-                ),
-                channel="summary"
-            )
-
         replacement_ids = build_support_face_vertex_replacement(
             transaction=transaction,
             bm=bm,
@@ -1254,6 +1386,24 @@ def build_reconstructed_face_for_selection(transaction,
             )
         )
 
+    # ------------------------------------------------------------
+    # Clean and validate final reconstructed polygon.
+    # ------------------------------------------------------------
+    rebuilt_tx_ids = collapse_transaction_ids_by_position(
+        transaction=transaction,
+        tx_ids=rebuilt_tx_ids
+    )
+
+    if len(rebuilt_tx_ids) < 3:
+        BX_log.warn(
+            "F_RECON skipped for face {0}: fewer than 3 verts after collapse, verts={1}.".format(
+                face_id,
+                rebuilt_tx_ids
+            ),
+            channel="summary"
+        )
+        return False
+
     expected_normal = list(face.normal_world)
 
     rebuilt_tx_ids = orient_transaction_face_indices_to_normal(
@@ -1262,47 +1412,40 @@ def build_reconstructed_face_for_selection(transaction,
         expected_normal=expected_normal
     )
 
-    if len(rebuilt_tx_ids) < 3:
-        BX_log.warn(
-            "F_RECON skipped for face {0}: fewer than 3 verts.".format(
-                face_id
-            ),
-            channel="transaction"
-        )
-        return None
-
-    build_inner_miter_local_caps_for_face(
+    if is_degenerate_transaction_polygon(
         transaction=transaction,
-        bm=bm,
-        face_id=face_id,
-        face_indices=rebuilt_tx_ids,
-        bevel_vertices=bevel_vertices,
-        vertex_boundaries=vertex_boundaries
-    )
-
-    if should_build_inner_cap_face(
-        transaction=transaction,
-        face_indices=rebuilt_tx_ids
+        vertex_ids=rebuilt_tx_ids
     ):
-        build_inner_cap_by_mode(
-            transaction=transaction,
-            bm=bm,
-            face_id=face_id,
-            face_indices=rebuilt_tx_ids,
-            bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries,
-            mode=(settings or {}).get("inner_cap_mode", INNER_CAP_AUTO),
-            build_local_miters=False
+        BX_log.warn(
+            "F_RECON skipped for face {0}: degenerate polygon verts={1}.".format(
+                face_id,
+                rebuilt_tx_ids
+            ),
+            channel="summary"
         )
+        return False
 
-        return None
-
-    return transaction.add_face(
+    face = add_bevel_face(
+        transaction=transaction,
         vertex_ids=rebuilt_tx_ids,
         face_kind=FACE_RECON,
         source_face_id=face_id,
-        expected_normal=expected_normal
+        source_edge_id=None,
+        expected_normal=expected_normal,
+        debug_label="F_RECON face {0}".format(face_id)
     )
+
+    if face is not None:
+        BX_log.warn(
+            "F_RECON built for face {0}: verts={1}".format(
+                face_id,
+                rebuilt_tx_ids
+            ),
+            channel="summary"
+        )
+        return True
+
+    return False
 
 def distance_point_to_segment(point, segment_a, segment_b):
     """
@@ -1703,584 +1846,6 @@ def build_support_replacement_from_available_boundaries(transaction,
 
     return tx_ids
 
-def build_inner_cap_fan(transaction, bm, face_id, face_indices):
-    """
-    Build an explicit triangle fan for a complex inner cap.
-
-    This is the next version of INNER_CAP_NONE:
-        - sort boundary vertices around the source face center
-        - create one generated center vertex
-        - create F_PATCH triangles from center to each boundary edge
-
-    This avoids relying on Maya's internal triangulation of a large ngon.
-    """
-
-    face = bm.faces[face_id]
-
-    expected_normal = list(face.normal_world)
-    face_center = list(face.center_world)
-
-    sorted_indices = sort_transaction_vertices_on_face(
-        transaction=transaction,
-        vertex_ids=face_indices,
-        face_center=face_center,
-        face_normal=expected_normal
-    )
-
-    sorted_indices = orient_transaction_face_indices_to_normal(
-        transaction=transaction,
-        face_indices=sorted_indices,
-        expected_normal=expected_normal
-    )
-
-    center = calculate_transaction_polygon_center(
-        transaction=transaction,
-        vertex_ids=sorted_indices
-    )
-
-    center_id = transaction.add_generated_vertex(center)
-
-    count = len(sorted_indices)
-
-    patch_faces = []
-
-    for i in range(count):
-        a = sorted_indices[i]
-        b = sorted_indices[(i + 1) % count]
-
-        tri_ids = [center_id, a, b]
-
-        tri_ids = orient_transaction_face_indices_to_normal(
-            transaction=transaction,
-            face_indices=tri_ids,
-            expected_normal=expected_normal
-        )
-
-        if len(tri_ids) != 3:
-            BX_log.debug("F_PATCH skipped non-triangle fan face on face {0}: verts={1}".format(
-                face_id, tri_ids), channel="caps"
-            )
-            continue
-
-        area = transaction_triangle_area(transaction=transaction, vertex_ids=tri_ids)
-        if is_degenerate_transaction_triangle(transaction=transaction, vertex_ids=tri_ids):
-            BX_log.debug("F_PATCH skipped degenerate fan triangle on face {0}: verts={1}, area={2}".format(
-                    face_id, tri_ids, area), channel="caps")
-            continue
-
-        patch_face = transaction.add_face(
-            vertex_ids=tri_ids,
-            face_kind=FACE_PATCH,
-            source_face_id=face_id,
-            expected_normal=expected_normal
-        )
-
-        patch_faces.append(patch_face)
-
-    if len(patch_faces) != count:
-        BX_log.debug("F_PATCH fan warning on face {0}: built {1}/{2} triangles.".format(
-                face_id, len(patch_faces), count), channel="caps")
-
-    return patch_faces
-
-def build_inner_cap_adj_lite(transaction,
-                             bm,
-                             face_id,
-                             face_indices,
-                             inner_scale=0.45,
-                             inner_miter_pull=0.25,
-                             bevel_vertices=None,
-                             vertex_boundaries=None):
-    """
-    Build first M_ADJ-lite inner cap.
-
-    This replaces one big ngon or one triangle fan with:
-        - generated inner ring
-        - F_PATCH quad ring
-        - F_CAP center polygon
-
-    It is not full Blender M_ADJ yet. It is a stable, readable,
-    segments=1 patch that avoids fan spokes across the whole cap.
-    """
-    BX_log.debug("Inner cap ADJ_LITE entered on face {0}: outer verts={1}".format(
-            face_id, face_indices), channel="caps")
-
-
-    face = bm.faces[face_id]
-
-    expected_normal = list(face.normal_world)
-    face_center = list(face.center_world)
-
-    sorted_outer_ids = sort_transaction_vertices_on_face(
-        transaction=transaction,
-        vertex_ids=face_indices,
-        face_center=face_center,
-        face_normal=expected_normal
-    )
-
-    sorted_outer_ids = orient_transaction_face_indices_to_normal(
-        transaction=transaction,
-        face_indices=sorted_outer_ids,
-        expected_normal=expected_normal
-    )
-
-    if len(sorted_outer_ids) < 3:
-        BX_log.debug("F_PATCH ADJ_LITE skipped for face {0}: fewer than 3 boundary verts.".format(
-                face_id), channel="caps")
-        return []
-
-    center = calculate_transaction_polygon_center(
-        transaction=transaction,
-        vertex_ids=sorted_outer_ids
-    )
-
-    count = len(sorted_outer_ids)
-
-    # Detect which outer segments are inner-miter segments before creating inner verts.
-    segment_is_inner_miter = []
-
-    for i in range(count):
-        outer_a = sorted_outer_ids[i]
-        outer_b = sorted_outer_ids[(i + 1) % count]
-
-        is_miter_segment = False
-
-        if bevel_vertices is not None and vertex_boundaries is not None:
-            is_miter_segment = should_use_inner_miter_patch_for_outer_pair(
-                transaction=transaction,
-                outer_a_id=outer_a,
-                outer_b_id=outer_b,
-                bevel_vertices=bevel_vertices,
-                vertex_boundaries=vertex_boundaries
-            )
-
-        segment_is_inner_miter.append(is_miter_segment)
-
-    # Generate inner ring.
-    # If an inner vertex touches an inner-miter segment, pull it farther toward center.
-    inner_ids = []
-
-    for i, outer_id in enumerate(sorted_outer_ids):
-        outer_point = transaction.vertices[outer_id].co_world
-
-        inner_point = bxm.lerp(
-            outer_point,
-            center,
-            inner_scale
-        )
-
-        prev_segment_index = (i - 1) % count
-        next_segment_index = i
-
-        touches_inner_miter = (
-            segment_is_inner_miter[prev_segment_index] or
-            segment_is_inner_miter[next_segment_index]
-        )
-
-        if touches_inner_miter:
-            inner_point = bxm.lerp(
-                inner_point,
-                center,
-                inner_miter_pull
-            )
-
-        inner_id = transaction.add_generated_vertex(inner_point)
-        inner_ids.append(inner_id)
-
-    created_faces = []
-    
-    # 1. Build quad ring.
-    for i in range(count):
-        outer_a = sorted_outer_ids[i]
-        outer_b = sorted_outer_ids[(i + 1) % count]
-        inner_b = inner_ids[(i + 1) % count]
-        inner_a = inner_ids[i]
-
-        quad_ids = [
-            outer_a,
-            outer_b,
-            inner_b,
-            inner_a
-        ]
-
-        quad_ids = orient_transaction_face_indices_to_normal(
-            transaction=transaction,
-            face_indices=quad_ids,
-            expected_normal=expected_normal
-        )
-
-        area = transaction_polygon_area(
-            transaction=transaction,
-            vertex_ids=quad_ids
-        )
-
-        if is_degenerate_transaction_polygon(
-            transaction=transaction,
-            vertex_ids=quad_ids
-        ):
-            BX_log.debug("F_PATCH ADJ_LITE skipped degenerate quad on face {0}: verts={1}, area={2}".format(
-                face_id, quad_ids, area), channel="caps")
-            continue
-
-        face_kind = FACE_PATCH
-
-        if segment_is_inner_miter[i]:
-            face_kind = FACE_INNER_MITER_PATCH
-
-        patch_face = transaction.add_face(
-            vertex_ids=quad_ids,
-            face_kind=face_kind,
-            source_face_id=face_id,
-            expected_normal=expected_normal
-        )
-
-        if face_kind == FACE_INNER_MITER_PATCH:
-            orig_id = get_transaction_vertex_original_id(
-                transaction=transaction, tx_id=outer_a
-            )
-            BX_log.debug("INNER_MITER_PATCH classified on face {0}, vertex {1}: verts={2}".format(
-                    face_id, orig_id, quad_ids), channel="miter")
-
-        created_faces.append(patch_face)
-
-    # 2. Build center cap polygon.
-    center_cap_ids = orient_transaction_face_indices_to_normal(
-        transaction=transaction,
-        face_indices=inner_ids,
-        expected_normal=expected_normal
-    )
-
-    center_area = transaction_polygon_area(transaction=transaction, vertex_ids=center_cap_ids)
-
-    if is_degenerate_transaction_polygon(transaction=transaction, vertex_ids=center_cap_ids):
-        BX_log.debug(
-            "F_CAP ADJ_LITE skipped degenerate center cap on face {0}: verts={1}, area={2}".format(
-                face_id, center_cap_ids, center_area), channel="caps")
-    else:
-        center_face = transaction.add_face(
-            vertex_ids=center_cap_ids,
-            face_kind=FACE_CAP,
-            source_face_id=face_id,
-            expected_normal=expected_normal
-        )
-
-        created_faces.append(center_face)
-
-    if len(created_faces) == 0:
-        BX_log.debug("F_PATCH ADJ_LITE failed on face {0}: no patch faces built.".format(
-                face_id), channel="caps")
-        
-    BX_log.debug("Inner cap ADJ_LITE built on face {0}: inner verts={1}, faces={2}".format(
-            face_id, inner_ids, len(created_faces)), channel="caps")
-
-    return created_faces
-
-def build_inner_miter_local_caps_for_face(transaction,
-                                          bm,
-                                          face_id,
-                                          face_indices,
-                                          bevel_vertices=None,
-                                          vertex_boundaries=None):
-    """
-    Build small local CHAIN_2 inner-miter filler caps on this source face.
-
-    These caps are required regardless of central cap mode:
-        - NGON
-        - FAN
-        - ADJ_LITE
-        - AUTO
-
-    They fill the little black triangular holes that appear at CHAIN_2
-    inner-miter vertices. The central cap mode only decides how the large
-    middle region is filled.
-    """
-
-    created_faces = []
-
-    if bevel_vertices is None or vertex_boundaries is None:
-        return created_faces
-
-    face = bm.faces[face_id]
-
-    expected_normal = list(face.normal_world)
-    face_center = list(face.center_world)
-
-    sorted_face_ids = sort_transaction_vertices_on_face(
-        transaction=transaction,
-        vertex_ids=face_indices,
-        face_center=face_center,
-        face_normal=expected_normal
-    )
-
-    sorted_face_ids = orient_transaction_face_indices_to_normal(
-        transaction=transaction,
-        face_indices=sorted_face_ids,
-        expected_normal=expected_normal
-    )
-
-    if len(sorted_face_ids) < 3:
-        return created_faces
-
-    count = len(sorted_face_ids)
-
-    segment_is_inner_miter = []
-
-    for i in range(count):
-        outer_a = sorted_face_ids[i]
-        outer_b = sorted_face_ids[(i + 1) % count]
-
-        is_miter_segment = should_use_inner_miter_patch_for_outer_pair(
-            transaction=transaction,
-            outer_a_id=outer_a,
-            outer_b_id=outer_b,
-            bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries
-        )
-
-        segment_is_inner_miter.append(is_miter_segment)
-
-    built_inner_miter_vertex_ids = set()
-
-    for i in range(count):
-        if not segment_is_inner_miter[i]:
-            continue
-
-        outer_a = sorted_face_ids[i]
-
-        orig_id = get_transaction_vertex_original_id(
-            transaction=transaction,
-            tx_id=outer_a
-        )
-
-        if orig_id is None:
-            continue
-
-        if orig_id in built_inner_miter_vertex_ids:
-            continue
-
-        built_inner_miter_vertex_ids.add(orig_id)
-
-        boundary_list = vertex_boundaries.get(orig_id, [])
-
-        if len(boundary_list) != 4:
-            BX_log.debug("INNER_MITER local cap skipped on face {0}, vertex {1}: expected 4 boundaries, got {2}".format(
-                    face_id, orig_id, len(boundary_list)), channel="miter")
-            continue
-
-        boundary_key = tuple(sorted([
-            getattr(boundary_vertex, "id", None)
-            for boundary_vertex in boundary_list
-        ]))
-
-        local_cap_key = (orig_id, boundary_key)
-
-        if local_cap_key in transaction.inner_miter_local_cap_keys:
-            BX_log.debug("INNER_MITER local cap skipped duplicate for vertex {0}: key={1}".format(
-                    orig_id, local_cap_key), channel="miter")
-            continue
-
-        local_cap_ids = [
-            transaction.add_boundary_vertex(boundary_vertex)
-            for boundary_vertex in boundary_list
-        ]
-
-        local_cap_ids = collapse_transaction_ids_by_position(transaction=transaction, tx_ids=local_cap_ids)
-
-        if len(local_cap_ids) < 3:
-            BX_log.debug("INNER_MITER local cap skipped on face {0}, vertex {1}: fewer than 3 unique verts={2}".format(
-                    face_id, orig_id, local_cap_ids), channel="miter")
-            continue
-
-        local_cap_ids = sort_transaction_vertices_on_face(
-            transaction=transaction,
-            vertex_ids=local_cap_ids,
-            face_center=face_center,
-            face_normal=expected_normal
-        )
-
-        local_cap_ids = orient_transaction_face_indices_to_normal(
-            transaction=transaction,
-            face_indices=local_cap_ids,
-            expected_normal=expected_normal
-        )
-
-        if is_degenerate_transaction_polygon(transaction=transaction, vertex_ids=local_cap_ids):
-            BX_log.debug("INNER_MITER local cap skipped degenerate on face {0}, vertex {1}: verts={2}".format(
-                    face_id, orig_id, local_cap_ids), channel="miter")
-            continue
-
-        local_cap_face = transaction.add_face(
-            vertex_ids=local_cap_ids,
-            face_kind=FACE_INNER_MITER_PATCH,
-            source_face_id=face_id,
-            expected_normal=expected_normal
-        )
-
-        transaction.inner_miter_local_cap_keys.add(local_cap_key)
-
-        created_faces.append(local_cap_face)
-
-        BX_log.debug("INNER_MITER local cap built on face {0}, vertex {1}: verts={2}".format(
-                face_id, orig_id, local_cap_ids), channel="miter")
-
-    return created_faces
-
-def build_inner_cap_by_mode(transaction,
-                            bm,
-                            face_id,
-                            face_indices,
-                            bevel_vertices=None,
-                            vertex_boundaries=None,
-                            mode=INNER_CAP_AUTO,
-                            build_local_miters=True):
-    """
-    Build an inner cap using the requested UI/settings mode.
-    """
-
-    created_faces = []
-
-    if build_local_miters:
-        local_faces = build_inner_miter_local_caps_for_face(
-            transaction=transaction,
-            bm=bm,
-            face_id=face_id,
-            face_indices=face_indices,
-            bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries
-        )
-
-        if local_faces:
-            created_faces.extend(local_faces)
-
-    if mode == INNER_CAP_NGON:
-        BX_log.debug("Inner cap mode NGON on face {0}.".format(face_id),
-                     channel="caps")
-
-        face = build_inner_cap_face(
-            transaction=transaction,
-            bm=bm,
-            face_id=face_id,
-            face_indices=face_indices
-        )
-
-        if face:
-            created_faces.append(face)
-
-        return created_faces
-
-    if mode == INNER_CAP_FAN:
-        BX_log.debug("Inner cap mode FAN on face {0}.".format(face_id),
-                     channel="caps")
-
-        faces = build_inner_cap_fan(
-            transaction=transaction,
-            bm=bm,
-            face_id=face_id,
-            face_indices=face_indices
-        )
-
-        created_faces.extend(faces)
-        return created_faces
-
-    if mode == INNER_CAP_ADJ_LITE:
-        BX_log.debug("Inner cap mode ADJ_LITE on face {0}.".format(face_id),
-                     channel="caps")
-
-        faces = build_inner_cap_adj_lite(
-            transaction=transaction,
-            bm=bm,
-            face_id=face_id,
-            face_indices=face_indices,
-            bevel_vertices=bevel_vertices,
-            vertex_boundaries=vertex_boundaries
-        )
-
-        created_faces.extend(faces)
-        return created_faces
-
-    BX_log.debug("Inner cap mode AUTO on face {0}.".format(face_id),
-                 channel="caps")
-
-    faces = build_inner_cap_auto(
-        transaction=transaction,
-        bm=bm,
-        face_id=face_id,
-        face_indices=face_indices,
-        bevel_vertices=bevel_vertices,
-        vertex_boundaries=vertex_boundaries
-    )
-
-    created_faces.extend(faces)
-    return created_faces
-
-def build_inner_cap_auto(transaction,
-                         bm,
-                         face_id,
-                         face_indices,
-                         bevel_vertices=None,
-                         vertex_boundaries=None):
-    """
-    First Auto mode.
-
-    Current strategy:
-        1. Try ADJ_LITE.
-        2. Fallback to FAN.
-        3. Fallback to NGON.
-    """
-
-    BX_log.debug("Inner cap AUTO entered on face {0}: verts={1}".format(
-            face_id, face_indices), channel="caps")
-
-    faces = build_inner_cap_adj_lite(
-        transaction=transaction,
-        bm=bm,
-        face_id=face_id,
-        face_indices=face_indices,
-        bevel_vertices=bevel_vertices,
-        vertex_boundaries=vertex_boundaries
-    )
-
-    if faces:
-        BX_log.debug("Inner cap AUTO used ADJ_LITE on face {0}: built {1} faces.".format(
-            face_id,len(faces)),channel="caps")
-        return faces
-
-    BX_log.debug("Inner cap AUTO ADJ_LITE failed on face {0}; falling back to FAN.".format(
-            face_id), channel="caps")
-
-    faces = build_inner_cap_fan(
-        transaction=transaction,
-        bm=bm,
-        face_id=face_id,
-        face_indices=face_indices
-    )
-
-    if faces:
-        BX_log.debug("Inner cap AUTO fallback used FAN on face {0}: built {1} faces.".format(
-            face_id,len(faces)),channel="caps")
-        return faces
-
-    BX_log.debug("Inner cap AUTO FAN failed on face {0}; falling back to NGON.".format(
-            face_id), channel="caps")
-
-    face = build_inner_cap_face(
-        transaction=transaction,
-        bm=bm,
-        face_id=face_id,
-        face_indices=face_indices
-    )
-
-    if face:
-        BX_log.debug("Inner cap AUTO fallback used NGON on face {0}.".format(
-            face_id),channel="caps")
-        return [face]
-
-    BX_log.warn("Inner cap AUTO failed on face {0}.".format(face_id),
-                channel="caps")
-
-    return []
-
-
 def get_transaction_vertex_original_id(transaction, tx_id):
     """
     Return original vertex id from a transaction vertex.
@@ -2609,11 +2174,14 @@ def build_corner2_miter_faces(transaction,
             )
             continue
 
-        face = transaction.add_face(
+        face = add_bevel_face(
+            transaction=transaction,
             vertex_ids=tx_vertex_ids,
             face_kind=FACE_VERT,
             source_face_id=None,
-            expected_normal=expected_normal
+            source_edge_id=None,
+            expected_normal=expected_normal,
+            debug_label="CORNER2 F_VERT vertex {0}".format(vertex_id)
         )
 
         created_faces.append(face)
@@ -2634,6 +2202,63 @@ def is_terminal_multi_boundary_vertex(boundary_vertex):
 
     return getattr(boundary_vertex, "source", None) == "TERMINAL_MULTI"
 
+def debug_sector_cap_ring(vertex_boundaries, vertex_id):
+    """
+    Log the unique sector cap ring for one original vertex.
+    """
+
+    boundary_list = vertex_boundaries.get(vertex_id, [])
+
+    sector_boundaries = get_unique_sector_cap_boundaries(
+        boundary_list
+    )
+
+    if not sector_boundaries:
+        return
+
+    BX_log.warn(
+        "SECTOR CAP RING vertex {0}: count={1}, ids={2}, roles={3}".format(
+            vertex_id,
+            len(sector_boundaries),
+            [
+                getattr(boundary_vertex, "id", None)
+                for boundary_vertex in sector_boundaries
+            ],
+            [
+                getattr(boundary_vertex, "boundary_role", None)
+                for boundary_vertex in sector_boundaries
+            ]
+        ),
+        channel="summary"
+    )
+
+def get_unique_sector_cap_boundaries(boundary_list):
+    """
+    Return one boundary vertex per SECTOR_BOUNDARY id.
+
+    Sector boundaries have multiple aliases:
+        - selected-edge aliases for F_EDGE
+        - edge_on aliases for F_RECON
+
+    The cap must use only one representative per sector id.
+    """
+
+    result = []
+    seen = set()
+
+    for boundary_vertex in boundary_list:
+        if not is_sector_boundary_vertex(boundary_vertex):
+            continue
+
+        boundary_id = getattr(boundary_vertex, "id", None)
+
+        if boundary_id in seen:
+            continue
+
+        seen.add(boundary_id)
+        result.append(boundary_vertex)
+
+    return result
 
 def get_terminal_multi_cap_boundaries(boundary_list):
     """
@@ -2655,6 +2280,96 @@ def get_terminal_multi_cap_boundaries(boundary_list):
         for boundary_vertex in boundary_list
         if is_terminal_multi_boundary_vertex(boundary_vertex)
     ]
+
+def build_sector_cap_faces(transaction,
+                           vertex_boundaries,
+                           bm=None):
+    """
+    Build simple segments == 1 F_VERT caps from unique sector boundaries.
+
+    This is the first BevelX equivalent of Blender's VMesh boundary cap:
+        BoundVert ring -> F_VERT polygon
+
+    Important:
+        Do not use every alias.
+        Use one unique boundary per sector id.
+    """
+
+    if bm is None:
+        return
+
+    for vertex_id in sorted(vertex_boundaries.keys()):
+        boundary_list = vertex_boundaries.get(vertex_id, [])
+
+        sector_boundaries = get_unique_sector_cap_boundaries(boundary_list)
+        debug_sector_cap_ring(vertex_boundaries=vertex_boundaries, vertex_id=vertex_id)
+
+        if len(sector_boundaries) < 3:
+            continue
+
+        tx_ids = []
+
+        for boundary_vertex in sector_boundaries:
+            tx_id = transaction.add_boundary_vertex(boundary_vertex)
+            tx_ids.append(tx_id)
+
+        tx_ids = collapse_transaction_ids_by_position(
+            transaction=transaction,
+            tx_ids=tx_ids
+        )
+
+        if len(tx_ids) < 3:
+            BX_log.warn(
+                "SECTOR F_VERT cap skipped for vertex {0}: collapsed count={1}".format(
+                    vertex_id,
+                    len(tx_ids)
+                ),
+                channel="summary"
+            )
+            continue
+
+        expected_normal = average_original_vertex_normal(
+            bm=bm,
+            vertex_id=vertex_id
+        )
+
+        tx_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tx_ids,
+            expected_normal=expected_normal
+        )
+
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=tx_ids
+        ):
+            BX_log.warn(
+                "SECTOR F_VERT cap skipped for vertex {0}: degenerate polygon ids={1}".format(
+                    vertex_id,
+                    tx_ids
+                ),
+                channel="summary"
+            )
+            continue
+
+        add_bevel_face(
+            transaction=transaction,
+            vertex_ids=tx_ids,
+            face_kind=FACE_VERT,
+            source_face_id=None,
+            source_edge_id=None,
+            expected_normal=expected_normal,
+            debug_label="F_VERT vertex {0}".format(vertex_id)
+        )
+
+        BX_log.warn(
+            "SECTOR F_VERT cap built for vertex {0}: count={1}, verts={2}".format(
+                vertex_id,
+                len(tx_ids),
+                tx_ids
+            ),
+            channel="summary"
+        )
 
 def build_terminal_multi_cap_faces(transaction,
                                    vertex_boundaries,
@@ -2751,12 +2466,14 @@ def build_terminal_multi_cap_faces(transaction,
             )
             continue
 
-        face = transaction.add_face(
+        face = add_bevel_face(
+            transaction=transaction,
             vertex_ids=tx_vertex_ids,
             face_kind=FACE_VERT,
             source_face_id=None,
             source_edge_id=None,
-            expected_normal=expected_normal
+            expected_normal=expected_normal,
+            debug_label="F_VERT vertex {0}".format(vertex_id)
         )
 
         created_faces.append(face)
@@ -2771,99 +2488,98 @@ def build_terminal_multi_cap_faces(transaction,
 
     return created_faces
 
-def is_chain_2_multi_cap_boundary_vertex(boundary_vertex):
-    return getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_CAP"
 
+###################################################################
+# Repid fix on n-Edge Pole Cap creation on high-valence vertices.
+###################################################################
 
-def build_chain_2_multi_cap_faces(transaction,
-                                  vertex_boundaries,
-                                  bm=None):
+def is_pole_n_boundary_vertex(boundary_vertex):
+    return getattr(boundary_vertex, "source", None) == "POLE_N"
+
+def get_pole_n_cap_boundaries(boundary_list):
+    return [
+        boundary_vertex
+        for boundary_vertex in boundary_list
+        if is_pole_n_boundary_vertex(boundary_vertex)
+    ]
+
+def build_pole_n_cap_faces(transaction,
+                           vertex_boundaries,
+                           bm=None):
     """
-    Build F_VERT cap faces for CHAIN_2_MULTI cap groups.
-
-    Cap endpoints are aliases of existing boundaries, so transaction vertex ids
-    should be shared with the bevel strip / fallback boundary vertices.
+    Build simple F_VERT caps for POLE_N boundaries.
     """
+
+    if bm is None:
+        return
 
     for vertex_id in sorted(vertex_boundaries.keys()):
         boundary_list = vertex_boundaries.get(vertex_id, [])
 
-        groups = {}
+        cap_boundaries = get_pole_n_cap_boundaries(
+            boundary_list
+        )
 
-        for boundary_vertex in boundary_list:
-            if not is_chain_2_multi_cap_boundary_vertex(boundary_vertex):
-                continue
+        if len(cap_boundaries) < 3:
+            continue
 
-            role = getattr(boundary_vertex, "boundary_role", None)
+        tx_ids = []
 
-            if role is None:
-                continue
-
-            groups.setdefault(role, []).append(boundary_vertex)
-
-        for role in sorted(groups.keys()):
-            cap_boundaries = groups[role]
-
-            if len(cap_boundaries) < 3:
-                continue
-
-            tx_vertex_ids = [
+        for boundary_vertex in cap_boundaries:
+            tx_ids.append(
                 transaction.add_boundary_vertex(boundary_vertex)
-                for boundary_vertex in cap_boundaries
-            ]
-
-            tx_vertex_ids = collapse_transaction_ids_by_position(
-                transaction=transaction,
-                tx_ids=tx_vertex_ids
             )
 
-            if len(tx_vertex_ids) < 3:
-                continue
+        tx_ids = collapse_transaction_ids_by_position(
+            transaction=transaction,
+            tx_ids=tx_ids
+        )
 
-            expected_normal = [0.0, 0.0, 0.0]
+        if len(tx_ids) < 3:
+            continue
 
-            if bm is not None:
-                expected_normal = average_original_vertex_normal(
-                    bm=bm,
-                    vertex_id=vertex_id
-                )
+        expected_normal = average_original_vertex_normal(
+            bm=bm,
+            vertex_id=vertex_id
+        )
 
-            if bxm.is_zero(expected_normal):
-                points = [
-                    transaction.vertices[tx_id].co_world
-                    for tx_id in tx_vertex_ids
-                ]
+        tx_ids = orient_transaction_face_indices_to_normal(
+            transaction=transaction,
+            face_indices=tx_ids,
+            expected_normal=expected_normal
+        )
 
-                expected_normal = calculate_polygon_normal(points)
-
-            tx_vertex_ids = orient_transaction_face_indices_to_normal(
-                transaction=transaction,
-                face_indices=tx_vertex_ids,
-                expected_normal=expected_normal
-            )
-
-            if is_degenerate_transaction_polygon(
-                transaction=transaction,
-                vertex_ids=tx_vertex_ids
-            ):
-                continue
-
-            transaction.add_face(
-                vertex_ids=tx_vertex_ids,
-                face_kind=FACE_VERT,
-                source_face_id=None,
-                source_edge_id=None,
-                expected_normal=expected_normal
-            )
-
+        if is_degenerate_transaction_polygon(
+            transaction=transaction,
+            vertex_ids=tx_ids
+        ):
             BX_log.warn(
-                "CHAIN_2_MULTI F_VERT cap built for vertex {0}, role={1}: verts={2}".format(
+                "POLE_N F_VERT cap skipped for vertex {0}: degenerate ids={1}".format(
                     vertex_id,
-                    role,
-                    tx_vertex_ids
+                    tx_ids
                 ),
                 channel="summary"
             )
+            continue
+
+        add_bevel_face(
+            transaction=transaction,
+            vertex_ids=tx_ids,
+            face_kind=FACE_VERT,
+            source_face_id=None,
+            source_edge_id=None,
+            expected_normal=expected_normal,
+            debug_label="F_VERT vertex {0}".format(vertex_id)
+        )
+
+        BX_log.warn(
+            "POLE_N F_VERT cap built for vertex {0}: count={1}, verts={2}".format(
+                vertex_id,
+                len(tx_ids),
+                tx_ids
+            ),
+            channel="summary"
+        )
 
 def build_vertex_cap_faces(transaction,
                            vertex_boundaries,
@@ -2880,25 +2596,19 @@ def build_vertex_cap_faces(transaction,
         not against their own calculated polygon normal. If the polygon normal
         is used as expected_normal, flipped POLE_N ngons can never be corrected.
     """
+    
+    build_corner2_miter_faces(transaction=transaction, vertex_boundaries=vertex_boundaries, bm=bm)
+    build_terminal_multi_cap_faces(transaction=transaction, vertex_boundaries=vertex_boundaries, bm=bm)
+    build_sector_cap_faces(transaction=transaction, vertex_boundaries=vertex_boundaries, bm=bm)
+    build_pole_n_cap_faces(transaction=transaction, vertex_boundaries=vertex_boundaries, bm=bm)
 
-    build_chain_2_multi_cap_faces(
-        transaction=transaction,
-        vertex_boundaries=vertex_boundaries,
-        bm=bm
-    )
-
-
-    build_terminal_multi_cap_faces(transaction=transaction,
-        vertex_boundaries=vertex_boundaries,
-        bm=bm
-    )
     for vertex_id in sorted(vertex_boundaries.keys()):
         boundary_list = vertex_boundaries.get(vertex_id, [])
 
         cap_boundaries = [
             boundary_vertex
             for boundary_vertex in boundary_list
-            if getattr(boundary_vertex, "source", None) in ("TRI_CAP", "POLE_N")
+            if getattr(boundary_vertex, "source", None) == "TRI_CAP"
         ]
 
         if not cap_boundaries:
@@ -2911,11 +2621,6 @@ def build_vertex_cap_faces(transaction,
                 vertex_id,
                 len(cap_boundaries)
             ), channel="caps")
-            continue
-
-        if source == "POLE_N" and len(cap_boundaries) < 4:
-            BX_log.warn("F_VERT skipped for vertex {0}: expected 4+ POLE_N boundaries, got {1}.".format(
-                    vertex_id, len(cap_boundaries)), channel="caps")
             continue
 
         tx_vertex_ids = [
@@ -2963,11 +2668,14 @@ def build_vertex_cap_faces(transaction,
             expected_normal=expected_normal
         )
 
-        transaction.add_face(
+        add_bevel_face(
+            transaction=transaction,
             vertex_ids=tx_vertex_ids,
             face_kind=FACE_VERT,
             source_face_id=None,
-            expected_normal=expected_normal
+            source_edge_id=None,
+            expected_normal=expected_normal,
+            debug_label="F_VERT vertex {0}".format(vertex_id)
         )
 
         BX_log.debug("F_VERT cap built for vertex {0}: source={1}, verts={2}, expected_normal={3}".format(
@@ -3061,11 +2769,14 @@ def build_edge_face(transaction, edge_data, vertex_boundaries):
         expected_normal=expected_normal
     )
 
-    return transaction.add_face(
+    return add_bevel_face(
+        transaction=transaction,
         vertex_ids=face_indices,
         face_kind=FACE_EDGE,
-        source_edge_id=edge_id,
-        expected_normal=expected_normal
+        source_face_id=None,
+        source_edge_id=edge_data["edge_id"],
+        expected_normal=expected_normal,
+        debug_label="F_EDGE edge {0}".format(edge_data["edge_id"])
     )
 
 # -----------------------------------------------------------------------------
@@ -3281,11 +2992,14 @@ def build_reconstructed_face(transaction,
         expected_normal=expected_normal
     )
 
-    return transaction.add_face(
+    return add_bevel_face(
+        transaction=transaction,
         vertex_ids=rebuilt_tx_ids,
         face_kind=FACE_RECON,
         source_face_id=face_id,
-        expected_normal=expected_normal
+        source_edge_id=None,
+        expected_normal=expected_normal,
+        debug_label="F_RECON face {0}".format(face_id)
     )
 
 def build_terminal_vertex_replacement_for_face(transaction,
@@ -3376,9 +3090,6 @@ def find_boundary(vertex_boundaries, vertex_id, face_id):
     boundary_list = vertex_boundaries.get(vertex_id, [])
 
     for boundary_vertex in boundary_list:
-        if getattr(boundary_vertex, "source", None) == "CHAIN_2_MULTI_CAP":
-            continue
-
         if boundary_vertex.face_id == face_id:
             return boundary_vertex
 

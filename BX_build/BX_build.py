@@ -175,7 +175,6 @@ def get_transaction_faces_in_apply_order(transaction):
     Order:
         F_EDGE  - bevel strips
         F_VERT  - vertex caps
-        F_CAP   - inner face caps
         F_PATCH - future patch faces
         F_RECON - rebuilt source faces
     """
@@ -185,7 +184,6 @@ def get_transaction_faces_in_apply_order(transaction):
         "F_VERT": 1,
         "F_INNER_MITER_PATCH": 2,
         "F_PATCH": 3,
-        "F_CAP": 4,
         "F_RECON": 5,
     }
 

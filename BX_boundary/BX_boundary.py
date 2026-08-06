@@ -6,9 +6,7 @@ from BX_math import BX_math as bxm
 from BX_math import BX_offset
 from BX_profile import BX_log
 
-CHAIN_2_MULTI_CAP = "CHAIN_2_MULTI_CAP"
-CHAIN_2_MULTI_GAP = "CHAIN_2_MULTI_GAP"
-CHAIN_2_MULTI_ON_EDGE = "CHAIN_2_MULTI_ON_EDGE"
+SECTOR_BOUNDARY = "SECTOR_BOUNDARY"
 
 class BX_BoundaryVertex(object):
     """
@@ -265,6 +263,31 @@ def has_unsupported_multi_edge_vertices(bevel_vertices):
 
     return False
 
+def is_all_incident_edges_selected(bevel_vertex):
+    """
+    Return True when every incident edge in the local edge ring is selected.
+
+    This is POLE_N / VMesh territory, not mixed SECTOR_BOUNDARY territory.
+    """
+
+    selected_edges = set(getattr(bevel_vertex, "selected_edges", []))
+    edge_ring = get_edge_ring_ids(bevel_vertex)
+
+    if not edge_ring:
+        return False
+
+    if not selected_edges:
+        return False
+
+    if len(selected_edges) != len(edge_ring):
+        return False
+
+    for edge_id in edge_ring:
+        if edge_id not in selected_edges:
+            return False
+
+    return True
+
 def is_supported_simple_pole_n(bevel_vertex, vertex_boundaries):
     """
     Return True for the first supported POLE_N case.
@@ -338,17 +361,52 @@ def get_unsupported_boundary_reason(bevel_vertices, vertex_boundaries=None):
     for vertex_id in sorted(bevel_vertices.keys()):
         bevel_vertex = bevel_vertices[vertex_id]
         selected_count = getattr(bevel_vertex, "selected_count", 0)
-
         if selected_count <= 3:
             continue
 
+        # ------------------------------------------------------------
+        # First accept all-incident POLE_N vertices.
+        # ------------------------------------------------------------
         if is_supported_simple_pole_n(
             bevel_vertex=bevel_vertex,
             vertex_boundaries=vertex_boundaries
         ):
-            BX_log.debug("Boundary validation accepted POLE_N vertex {0}: selected_count={1}".format(
-                vertex_id, selected_count), channel="boundary")
+            BX_log.warn(
+                "Boundary validation accepted POLE_N vertex {0}: selected_count={1}".format(
+                    vertex_id,
+                    selected_count
+                ),
+                channel="summary"
+            )
             continue
+
+        # ------------------------------------------------------------
+        # Then accept mixed high-valence sector rings.
+        # ------------------------------------------------------------
+        if vertex_boundaries is not None:
+            boundary_list = vertex_boundaries.get(vertex_id, [])
+
+            sector_ids = set()
+
+            for boundary_vertex in boundary_list:
+                if getattr(boundary_vertex, "source", None) != SECTOR_BOUNDARY:
+                    continue
+
+                boundary_id = getattr(boundary_vertex, "id", None)
+
+                if boundary_id is not None:
+                    sector_ids.add(boundary_id)
+
+            if len(sector_ids) == selected_count:
+                BX_log.warn(
+                    "Boundary validation accepted SECTOR vertex {0}: selected_count={1}, sector_count={2}".format(
+                        vertex_id,
+                        selected_count,
+                        len(sector_ids)
+                    ),
+                    channel="summary"
+                )
+                continue
 
         unsupported.append(
             "vertex {0} has {1} selected edges; full VMesh/corner cap is not implemented yet".format(
@@ -356,6 +414,25 @@ def get_unsupported_boundary_reason(bevel_vertices, vertex_boundaries=None):
                 selected_count
             )
         )
+        if selected_count >= 4:
+            if vertex_boundaries is not None:
+                boundary_list = vertex_boundaries.get(vertex_id, [])
+
+                sector_ids = set()
+
+                for boundary_vertex in boundary_list:
+                    if getattr(boundary_vertex, "source", None) != SECTOR_BOUNDARY:
+                        continue
+
+                    sector_ids.add(getattr(boundary_vertex, "id", None))
+
+                if len(sector_ids) == selected_count:
+                    continue
+
+            return "vertex {0} has {1} selected edges; sector boundary ring is incomplete".format(
+                vertex_id,
+                selected_count
+            )
 
     if not unsupported:
         return None
@@ -443,6 +520,433 @@ def cyclic_gap_between_edges(edge_ring, start_edge_id, end_edge_id):
 
     return result
 
+#########################################################
+# Sector Boundary helpers.
+#########################################################
+def get_selected_edges_in_ring(bevel_vertex):
+    """
+    Return selected edge ids in cyclic edge-ring order.
+    """
+
+    edge_ring = get_edge_ring_ids(bevel_vertex)
+    selected_edges = set(getattr(bevel_vertex, "selected_edges", []))
+
+    return [
+        edge_id
+        for edge_id in edge_ring
+        if edge_id in selected_edges
+    ]
+
+def average_points(points):
+    """
+    Average a list of 3D points.
+    """
+
+    clean = [
+        point
+        for point in points
+        if point is not None
+    ]
+
+    if not clean:
+        return None
+
+    result = [0.0, 0.0, 0.0]
+
+    for point in clean:
+        result = bxm.add(result, point)
+
+    return bxm.div(result, float(len(clean)))
+
+def make_sector_boundary_id(vertex_id, sector_index, edge_start_id, edge_end_id):
+    return "BV{0}_SECTOR_{1}_E{2}_E{3}".format(
+        vertex_id,
+        sector_index,
+        edge_start_id,
+        edge_end_id
+    )
+
+def build_adjacent_sector_boundaries(bm,
+                                     vertex_id,
+                                     edge_start_id,
+                                     edge_end_id,
+                                     edge_data_by_id,
+                                     rails_by_edge_id,
+                                     sector_index):
+    """
+    Build one sector boundary for adjacent selected edges.
+
+    Both aliases share one boundary id:
+        selected_edge_id=edge_start_id, face_id=common_face
+        selected_edge_id=edge_end_id,   face_id=common_face
+    """
+
+    common_face = get_face_between_ordered_edges(
+        bm=bm,
+        edge_a_id=edge_start_id,
+        edge_b_id=edge_end_id
+    )
+
+    if common_face is None:
+        BX_log.warn(
+            "SECTOR adjacent skipped vertex {0}: no common face, start={1}, end={2}".format(
+                vertex_id,
+                edge_start_id,
+                edge_end_id
+            ),
+            channel="summary"
+        )
+        return []
+
+    edge_start_data = edge_data_by_id.get(edge_start_id)
+    edge_end_data = edge_data_by_id.get(edge_end_id)
+
+    rails_start = rails_by_edge_id.get(edge_start_id, [])
+    rails_end = rails_by_edge_id.get(edge_end_id, [])
+
+    point = None
+
+    if edge_start_data is not None and edge_end_data is not None:
+        point = get_common_face_miter_point(
+            edge_a_data=edge_start_data,
+            rails_a=rails_start,
+            edge_b_data=edge_end_data,
+            rails_b=rails_end,
+            common_face_id=common_face
+        )
+
+    if point is None:
+        point_a = get_rail_endpoint_for_edge_face(
+            edge_data_by_id=edge_data_by_id,
+            rails_by_edge_id=rails_by_edge_id,
+            edge_id=edge_start_id,
+            face_id=common_face,
+            vertex_id=vertex_id
+        )
+
+        point_b = get_rail_endpoint_for_edge_face(
+            edge_data_by_id=edge_data_by_id,
+            rails_by_edge_id=rails_by_edge_id,
+            edge_id=edge_end_id,
+            face_id=common_face,
+            vertex_id=vertex_id
+        )
+
+        point = average_points([point_a, point_b])
+
+    if point is None:
+        BX_log.warn(
+            "SECTOR adjacent skipped vertex {0}: no point, sector={1}->{2}, face={3}".format(
+                vertex_id,
+                edge_start_id,
+                edge_end_id,
+                common_face
+            ),
+            channel="summary"
+        )
+        return []
+
+    boundary_id = make_sector_boundary_id(
+        vertex_id=vertex_id,
+        sector_index=sector_index,
+        edge_start_id=edge_start_id,
+        edge_end_id=edge_end_id
+    )
+
+    role = "SECTOR_{0}".format(sector_index)
+
+    result = [
+        BX_BoundaryVertex(
+            boundary_id=boundary_id,
+            original_vertex_id=vertex_id,
+            selected_edge_id=edge_start_id,
+            face_id=common_face,
+            co_world=point,
+            source=SECTOR_BOUNDARY,
+            edge_before_id=edge_start_id,
+            edge_after_id=edge_end_id,
+            edge_on_id=edge_start_id,
+            boundary_role=role
+        ),
+
+        BX_BoundaryVertex(
+            boundary_id=boundary_id,
+            original_vertex_id=vertex_id,
+            selected_edge_id=edge_end_id,
+            face_id=common_face,
+            co_world=point,
+            source=SECTOR_BOUNDARY,
+            edge_before_id=edge_start_id,
+            edge_after_id=edge_end_id,
+            edge_on_id=edge_end_id,
+            boundary_role=role
+        )
+    ]
+
+    BX_log.warn(
+        "SECTOR adjacent built vertex {0}: id={1}, sector={2}->{3}, face={4}, aliases={5}, point={6}".format(
+            vertex_id,
+            boundary_id,
+            edge_start_id,
+            edge_end_id,
+            common_face,
+            len(result),
+            point
+        ),
+        channel="summary"
+    )
+
+    return result
+
+def build_gap_sector_boundaries(bm,
+                                vertex_id,
+                                edge_start_id,
+                                edge_end_id,
+                                gap_edge_ids,
+                                edge_data_by_id,
+                                rails_by_edge_id,
+                                sector_index):
+    """
+    Build one shared sector boundary for a gap between selected edges.
+
+    All aliases share one boundary id:
+        selected start side
+        middle edge_on aliases
+        selected end side
+    """
+
+    if not gap_edge_ids:
+        return build_adjacent_sector_boundaries(
+            bm=bm,
+            vertex_id=vertex_id,
+            edge_start_id=edge_start_id,
+            edge_end_id=edge_end_id,
+            edge_data_by_id=edge_data_by_id,
+            rails_by_edge_id=rails_by_edge_id,
+            sector_index=sector_index
+        )
+
+    first_gap_edge_id = gap_edge_ids[0]
+    last_gap_edge_id = gap_edge_ids[-1]
+
+    face_start = get_face_between_ordered_edges(
+        bm=bm,
+        edge_a_id=edge_start_id,
+        edge_b_id=first_gap_edge_id
+    )
+
+    face_end = get_face_between_ordered_edges(
+        bm=bm,
+        edge_a_id=last_gap_edge_id,
+        edge_b_id=edge_end_id
+    )
+
+    start_point = get_rail_endpoint_for_edge_face(
+        edge_data_by_id=edge_data_by_id,
+        rails_by_edge_id=rails_by_edge_id,
+        edge_id=edge_start_id,
+        face_id=face_start,
+        vertex_id=vertex_id
+    )
+
+    end_point = get_rail_endpoint_for_edge_face(
+        edge_data_by_id=edge_data_by_id,
+        rails_by_edge_id=rails_by_edge_id,
+        edge_id=edge_end_id,
+        face_id=face_end,
+        vertex_id=vertex_id
+    )
+
+    if start_point is None or end_point is None:
+        BX_log.warn(
+            "SECTOR gap skipped vertex {0}: missing anchors, sector={1}->{2}, gap={3}, face_start={4}, face_end={5}".format(
+                vertex_id,
+                edge_start_id,
+                edge_end_id,
+                gap_edge_ids,
+                face_start,
+                face_end
+            ),
+            channel="summary"
+        )
+        return []
+
+    vertex_point = bm.vertices[vertex_id].co_world
+
+    width_start = bxm.distance(vertex_point, start_point)
+    width_end = bxm.distance(vertex_point, end_point)
+    width = 0.5 * (width_start + width_end)
+
+    candidates = [
+        start_point,
+        end_point
+    ]
+
+    for middle_edge_id in gap_edge_ids:
+        slide_point = slide_boundary_point_on_edge(
+            bm=bm,
+            vertex_id=vertex_id,
+            edge_id=middle_edge_id,
+            distance=width
+        )
+
+        if slide_point is not None:
+            candidates.append(slide_point)
+
+    point = average_points(candidates)
+
+    if point is None:
+        return []
+
+    boundary_id = make_sector_boundary_id(
+        vertex_id=vertex_id,
+        sector_index=sector_index,
+        edge_start_id=edge_start_id,
+        edge_end_id=edge_end_id
+    )
+
+    role = "SECTOR_{0}".format(sector_index)
+
+    result = []
+
+    result.append(
+        BX_BoundaryVertex(
+            boundary_id=boundary_id,
+            original_vertex_id=vertex_id,
+            selected_edge_id=edge_start_id,
+            face_id=face_start,
+            co_world=point,
+            source=SECTOR_BOUNDARY,
+            edge_before_id=edge_start_id,
+            edge_after_id=first_gap_edge_id,
+            edge_on_id=edge_start_id,
+            boundary_role=role
+        )
+    )
+
+    for middle_edge_id in gap_edge_ids:
+        result.append(
+            BX_BoundaryVertex(
+                boundary_id=boundary_id,
+                original_vertex_id=vertex_id,
+                selected_edge_id=None,
+                face_id=None,
+                co_world=point,
+                source=SECTOR_BOUNDARY,
+                edge_before_id=edge_start_id,
+                edge_after_id=edge_end_id,
+                edge_on_id=middle_edge_id,
+                boundary_role=role
+            )
+        )
+
+    result.append(
+        BX_BoundaryVertex(
+            boundary_id=boundary_id,
+            original_vertex_id=vertex_id,
+            selected_edge_id=edge_end_id,
+            face_id=face_end,
+            co_world=point,
+            source=SECTOR_BOUNDARY,
+            edge_before_id=last_gap_edge_id,
+            edge_after_id=edge_end_id,
+            edge_on_id=edge_end_id,
+            boundary_role=role
+        )
+    )
+
+    BX_log.warn(
+        "SECTOR gap built vertex {0}: id={1}, sector={2}->{3}, gap={4}, aliases={5}, point={6}".format(
+            vertex_id,
+            boundary_id,
+            edge_start_id,
+            edge_end_id,
+            gap_edge_ids,
+            len(result),
+            point
+        ),
+        channel="summary"
+    )
+
+    return result
+
+def build_sector_boundary_for_vertex(bm,
+                                     bevel_vertex,
+                                     edge_data_by_id,
+                                     rails_by_edge_id):
+    """
+    Blender-style sector boundary builder.
+
+    One unique sector boundary is created for each span between consecutive
+    selected edges in the cyclic edge ring.
+
+    Aliases are created for F_EDGE and F_RECON lookup, but every alias in one
+    sector shares the same boundary id.
+    """
+
+    vertex_id = bevel_vertex.vertex_id
+    edge_ring = get_edge_ring_ids(bevel_vertex)
+    selected_in_ring = get_selected_edges_in_ring(bevel_vertex)
+
+    if len(selected_in_ring) < 2:
+        return []
+
+    boundary_list = []
+
+    count = len(selected_in_ring)
+
+    for sector_index in range(count):
+        edge_start_id = selected_in_ring[sector_index]
+        edge_end_id = selected_in_ring[(sector_index + 1) % count]
+
+        gap_edge_ids = cyclic_gap_between_edges(
+            edge_ring=edge_ring,
+            start_edge_id=edge_start_id,
+            end_edge_id=edge_end_id
+        )
+
+        sector_boundaries = build_gap_sector_boundaries(
+            bm=bm,
+            vertex_id=vertex_id,
+            edge_start_id=edge_start_id,
+            edge_end_id=edge_end_id,
+            gap_edge_ids=gap_edge_ids,
+            edge_data_by_id=edge_data_by_id,
+            rails_by_edge_id=rails_by_edge_id,
+            sector_index=sector_index
+        )
+
+        boundary_list.extend(sector_boundaries)
+
+    link_boundary_vertices_cyclic(boundary_list)
+
+    unique_ids = []
+    seen = set()
+
+    for boundary_vertex in boundary_list:
+        if boundary_vertex.id in seen:
+            continue
+
+        seen.add(boundary_vertex.id)
+        unique_ids.append(boundary_vertex.id)
+
+    BX_log.warn(
+        "SECTOR boundary built vertex {0}: selected={1}, ring={2}, unique_count={3}, alias_count={4}, ids={5}".format(
+            vertex_id,
+            selected_in_ring,
+            edge_ring,
+            len(unique_ids),
+            len(boundary_list),
+            unique_ids
+        ),
+        channel="summary"
+    )
+
+    return boundary_list
+
+############################################################
+# Chain 2 multi-edge boundary helpers.
+############################################################
 
 def is_chain_2_multi_vertex(bm, bevel_vertex):
     """
@@ -534,264 +1038,6 @@ def average_chain_2_multi_points(points):
 
     return bxm.div(result, float(len(clean_points)))
 
-def solve_chain_2_multi_gap_point(boundary_list,
-                                  bm,
-                                  vertex_id,
-                                  edge_start_id,
-                                  edge_end_id,
-                                  gap_edge_ids,
-                                  gap_role):
-    """
-    Solve one shared CHAIN_2_MULTI gap/junction point.
-
-    Blender-like intent:
-        All non-selected edges between two selected edges attach to one
-        BoundVert-style juncture.
-
-    This is not a cap point.
-    This is the shared boundary point for the whole gap sector.
-    """
-
-    if not gap_edge_ids:
-        return None, None, None
-
-    first_gap_edge_id = gap_edge_ids[0]
-    last_gap_edge_id = gap_edge_ids[-1]
-
-    face_start = get_face_between_ordered_edges(
-        bm=bm,
-        edge_a_id=edge_start_id,
-        edge_b_id=first_gap_edge_id
-    )
-
-    face_end = get_face_between_ordered_edges(
-        bm=bm,
-        edge_a_id=last_gap_edge_id,
-        edge_b_id=edge_end_id
-    )
-
-    start_anchor = find_existing_selected_boundary_for_gap_side(
-        boundary_list=boundary_list,
-        edge_id=edge_start_id,
-        face_id=face_start
-    )
-
-    end_anchor = find_existing_selected_boundary_for_gap_side(
-        boundary_list=boundary_list,
-        edge_id=edge_end_id,
-        face_id=face_end
-    )
-
-    if start_anchor is None or end_anchor is None:
-        BX_log.warn(
-            "CHAIN_2_MULTI gap solve skipped at vertex {0}, role={1}: missing anchors start={2}/{3}, end={4}/{5}".format(
-                vertex_id,
-                gap_role,
-                edge_start_id,
-                face_start,
-                edge_end_id,
-                face_end
-            ),
-            channel="summary"
-        )
-        return None, start_anchor, end_anchor
-
-    vertex_point = bm.vertices[vertex_id].co_world
-
-    width_start = bxm.distance(vertex_point, start_anchor.co_world)
-    width_end = bxm.distance(vertex_point, end_anchor.co_world)
-    width = 0.5 * (width_start + width_end)
-
-    candidate_points = [
-        start_anchor.co_world,
-        end_anchor.co_world
-    ]
-
-    # Add slide probes on every middle edge. These are not separate final
-    # boundary vertices. They only help locate the shared gap point.
-    for middle_edge_id in gap_edge_ids:
-        slide_point = slide_boundary_point_on_edge(
-            bm=bm,
-            vertex_id=vertex_id,
-            edge_id=middle_edge_id,
-            distance=width
-        )
-
-        if slide_point is not None:
-            candidate_points.append(slide_point)
-
-    # If exactly one middle edge exists, add Blender-style offset_on_edge_between
-    # as one more candidate. But it is still averaged into the single gap point.
-    if len(gap_edge_ids) == 1:
-        middle_edge_id = gap_edge_ids[0]
-
-        edge_start_other = get_other_vertex_point_on_edge(
-            bm=bm,
-            edge_id=edge_start_id,
-            vertex_id=vertex_id
-        )
-
-        middle_other = get_other_vertex_point_on_edge(
-            bm=bm,
-            edge_id=middle_edge_id,
-            vertex_id=vertex_id
-        )
-
-        edge_end_other = get_other_vertex_point_on_edge(
-            bm=bm,
-            edge_id=edge_end_id,
-            vertex_id=vertex_id
-        )
-
-        vertex_normal = average_terminal_multi_vertex_normal(
-            bm=bm,
-            vertex_id=vertex_id
-        )
-
-        solve = BX_offset.offset_on_edge_between(
-            vertex_position=vertex_point,
-            edge_a_other_position=edge_start_other,
-            middle_edge_other_position=middle_other,
-            edge_b_other_position=edge_end_other,
-            offset_a_right=width_start,
-            offset_b_left=width_end,
-            vertex_normal=vertex_normal
-        )
-
-        solve_point = solve.get("point")
-
-        if solve_point is not None and middle_other is not None:
-            solve_point = bxm.closest_point_on_segment(
-                solve_point,
-                vertex_point,
-                middle_other
-            )
-
-            candidate_points.append(solve_point)
-
-    gap_point = average_chain_2_multi_points(candidate_points)
-
-    BX_log.warn(
-        "CHAIN_2_MULTI gap solved at vertex {0}, role={1}: start={2}, middles={3}, end={4}, point={5}, candidates={6}".format(
-            vertex_id,
-            gap_role,
-            getattr(start_anchor, "id", None),
-            gap_edge_ids,
-            getattr(end_anchor, "id", None),
-            gap_point,
-            len(candidate_points)
-        ),
-        channel="summary"
-    )
-
-    return gap_point, start_anchor, end_anchor
-
-def build_chain_2_multi_gap_alias_boundaries(boundary_list,
-                                             bm,
-                                             vertex_id,
-                                             edge_start_id,
-                                             edge_end_id,
-                                             gap_edge_ids,
-                                             gap_role):
-    """
-    Build aliases for one CHAIN_2_MULTI gap.
-
-    Critical rule:
-        Every alias in this gap shares the same boundary_id.
-
-    That means:
-        - selected edge side A
-        - selected edge side B
-        - all intermediate non-selected edges
-
-    all become the same transaction vertex, like one Blender BoundVert.
-    """
-
-    if not gap_edge_ids:
-        return []
-
-    gap_point, start_anchor, end_anchor = solve_chain_2_multi_gap_point(
-        boundary_list=boundary_list,
-        bm=bm,
-        vertex_id=vertex_id,
-        edge_start_id=edge_start_id,
-        edge_end_id=edge_end_id,
-        gap_edge_ids=gap_edge_ids,
-        gap_role=gap_role
-    )
-
-    if gap_point is None or start_anchor is None or end_anchor is None:
-        return []
-
-    gap_boundary_id = "BV{0}_CHAIN2_MULTI_GAP_{1}".format(
-        vertex_id,
-        gap_role
-    )
-
-    aliases = []
-
-    # Selected start side alias.
-    aliases.append(
-        BX_BoundaryVertex(
-            boundary_id=gap_boundary_id,
-            original_vertex_id=vertex_id,
-            selected_edge_id=edge_start_id,
-            face_id=start_anchor.face_id,
-            co_world=gap_point,
-            source=CHAIN_2_MULTI_GAP,
-            edge_before_id=edge_start_id,
-            edge_after_id=gap_edge_ids[0],
-            edge_on_id=edge_start_id,
-            boundary_role=gap_role
-        )
-    )
-
-    # Middle non-selected edges. Same id. Same point.
-    for middle_edge_id in gap_edge_ids:
-        aliases.append(
-            BX_BoundaryVertex(
-                boundary_id=gap_boundary_id,
-                original_vertex_id=vertex_id,
-                selected_edge_id=None,
-                face_id=None,
-                co_world=gap_point,
-                source=CHAIN_2_MULTI_GAP,
-                edge_before_id=edge_start_id,
-                edge_after_id=edge_end_id,
-                edge_on_id=middle_edge_id,
-                boundary_role=gap_role
-            )
-        )
-
-    # Selected end side alias.
-    aliases.append(
-        BX_BoundaryVertex(
-            boundary_id=gap_boundary_id,
-            original_vertex_id=vertex_id,
-            selected_edge_id=edge_end_id,
-            face_id=end_anchor.face_id,
-            co_world=gap_point,
-            source=CHAIN_2_MULTI_GAP,
-            edge_before_id=gap_edge_ids[-1],
-            edge_after_id=edge_end_id,
-            edge_on_id=edge_end_id,
-            boundary_role=gap_role
-        )
-    )
-
-    BX_log.warn(
-        "CHAIN_2_MULTI gap aliases built at vertex {0}, role={1}: id={2}, aliases={3}, edges={4}".format(
-            vertex_id,
-            gap_role,
-            gap_boundary_id,
-            len(aliases),
-            [edge_start_id] + list(gap_edge_ids) + [edge_end_id]
-        ),
-        channel="summary"
-    )
-
-    return aliases
-
 
 def debug_chain_2_multi_vertex(bm, bevel_vertex):
     """
@@ -870,318 +1116,6 @@ def collapse_boundary_vertices_by_position(boundary_vertices,
             result.append(boundary_vertex)
 
     return result
-
-def build_chain_2_multi_boundary_for_vertex(bm,
-                                            bevel_vertex,
-                                            edge_data_by_id,
-                                            rails_by_edge_id):
-    """
-    CHAIN_2_MULTI high-valence selected_count == 2 vertex.
-
-    Blender-like stage:
-        - build fallback only as raw anchor input
-        - collapse each cyclic gap into one BoundVert-style point
-        - return aliases that make selected-edge strips and F_RECON share
-          the same gap vertices
-        - do not build caps yet
-    """
-
-    debug_chain_2_multi_vertex(
-        bm=bm,
-        bevel_vertex=bevel_vertex
-    )
-
-    vertex_id = bevel_vertex.vertex_id
-    selected_edges = list(getattr(bevel_vertex, "selected_edges", []))
-    edge_ring = get_edge_ring_ids(bevel_vertex)
-
-    fallback_boundaries = build_selected_count_2_fallback_boundary_for_vertex(
-        bm=bm,
-        bevel_vertex=bevel_vertex,
-        edge_data_by_id=edge_data_by_id,
-        rails_by_edge_id=rails_by_edge_id
-    )
-
-    if fallback_boundaries is None:
-        fallback_boundaries = []
-
-    debug_chain_2_multi_probe_points(
-        boundary_list=fallback_boundaries,
-        bm=bm,
-        bevel_vertex=bevel_vertex,
-        edge_data_by_id=edge_data_by_id,
-        rails_by_edge_id=rails_by_edge_id
-    )
-
-    if len(selected_edges) != 2:
-        return fallback_boundaries
-
-    if len(edge_ring) <= 2:
-        return fallback_boundaries
-
-    edge_a_id = selected_edges[0]
-    edge_b_id = selected_edges[1]
-
-    gap_ab = cyclic_gap_between_edges(
-        edge_ring=edge_ring,
-        start_edge_id=edge_a_id,
-        end_edge_id=edge_b_id
-    )
-
-    gap_ba = cyclic_gap_between_edges(
-        edge_ring=edge_ring,
-        start_edge_id=edge_b_id,
-        end_edge_id=edge_a_id
-    )
-
-    boundary_list = []
-
-    boundary_list.extend(
-        build_chain_2_multi_gap_alias_boundaries(
-            boundary_list=fallback_boundaries,
-            bm=bm,
-            vertex_id=vertex_id,
-            edge_start_id=edge_a_id,
-            edge_end_id=edge_b_id,
-            gap_edge_ids=gap_ab,
-            gap_role="AB"
-        )
-    )
-
-    boundary_list.extend(
-        build_chain_2_multi_gap_alias_boundaries(
-            boundary_list=fallback_boundaries,
-            bm=bm,
-            vertex_id=vertex_id,
-            edge_start_id=edge_b_id,
-            edge_end_id=edge_a_id,
-            gap_edge_ids=gap_ba,
-            gap_role="BA"
-        )
-    )
-
-    if not boundary_list:
-        BX_log.warn(
-            "CHAIN_2_MULTI gap aliases empty at vertex {0}; falling back to old selected boundaries.".format(
-                vertex_id
-            ),
-            channel="summary"
-        )
-        return fallback_boundaries
-
-    link_boundary_vertices_cyclic(boundary_list)
-
-    BX_log.warn(
-        "CHAIN_2_MULTI boundary built for vertex {0}: gap_aliases={1}, total={2}".format(
-            vertex_id,
-            len(boundary_list),
-            len(boundary_list)
-        ),
-        channel="summary"
-    )
-
-    return boundary_list
-
-def build_chain_2_multi_single_gap_cap_boundaries(boundary_list,
-                                                  bm,
-                                                  vertex_id,
-                                                  edge_start_id,
-                                                  edge_end_id,
-                                                  gap_edge_ids,
-                                                  gap_role):
-    """
-    Build CHAIN_2_MULTI cap boundaries only for a single-middle-edge gap.
-
-    For:
-        selected_start -> middle_edge -> selected_end
-
-    Build triangle:
-        existing start boundary alias
-        solved middle point on middle_edge
-        existing end boundary alias
-
-    Multi-edge gaps are intentionally skipped because support reconstruction
-    already handles those sectors.
-    """
-
-    if not gap_edge_ids:
-        BX_log.warn(
-            "CHAIN_2_MULTI cap skipped at vertex {0}, role={1}: adjacent selected edges.".format(
-                vertex_id,
-                gap_role
-            ),
-            channel="summary"
-        )
-        return []
-
-    if len(gap_edge_ids) != 1:
-        BX_log.warn(
-            "CHAIN_2_MULTI cap skipped at vertex {0}, role={1}: multi-edge gap handled by support reconstruction, gap={2}".format(
-                vertex_id,
-                gap_role,
-                gap_edge_ids
-            ),
-            channel="summary"
-        )
-        return []
-
-    middle_edge_id = gap_edge_ids[0]
-
-    face_start = get_face_between_ordered_edges(
-        bm=bm,edge_a_id=edge_start_id,edge_b_id=middle_edge_id)
-    face_end = get_face_between_ordered_edges(
-        bm=bm,edge_a_id=middle_edge_id,edge_b_id=edge_end_id)
-    start_anchor = find_existing_selected_boundary_for_gap_side(
-        boundary_list=boundary_list,edge_id=edge_start_id,face_id=face_start)
-    end_anchor = find_existing_selected_boundary_for_gap_side(
-        boundary_list=boundary_list,edge_id=edge_end_id,face_id=face_end)
-
-    if start_anchor is None or end_anchor is None:
-        BX_log.warn(
-            "CHAIN_2_MULTI single-gap cap skipped at vertex {0}, role={1}: missing anchors. start_edge={2}, face_start={3}, end_edge={4}, face_end={5}, start_anchor={6}, end_anchor={7}".format(
-                vertex_id,
-                gap_role,
-                edge_start_id,
-                face_start,
-                edge_end_id,
-                face_end,
-                getattr(start_anchor, "id", None),
-                getattr(end_anchor, "id", None)
-            ),
-            channel="summary"
-        )
-        return []
-
-    vertex_point = bm.vertices[vertex_id].co_world
-
-    width_start = bxm.distance(vertex_point,start_anchor.co_world)
-    width_end = bxm.distance(vertex_point,end_anchor.co_world)
-
-    edge_start_other = get_other_vertex_point_on_edge(
-        bm=bm,
-        edge_id=edge_start_id,
-        vertex_id=vertex_id
-    )
-
-    middle_other = get_other_vertex_point_on_edge(
-        bm=bm,
-        edge_id=middle_edge_id,
-        vertex_id=vertex_id
-    )
-
-    edge_end_other = get_other_vertex_point_on_edge(
-        bm=bm,
-        edge_id=edge_end_id,
-        vertex_id=vertex_id
-    )
-
-    vertex_normal = average_terminal_multi_vertex_normal(
-        bm=bm,
-        vertex_id=vertex_id
-    )
-
-    solve = BX_offset.offset_on_edge_between(
-        vertex_position=vertex_point,
-        edge_a_other_position=edge_start_other,
-        middle_edge_other_position=middle_other,
-        edge_b_other_position=edge_end_other,
-        offset_a_right=width_start,
-        offset_b_left=width_end,
-        vertex_normal=vertex_normal
-    )
-
-    solve_point = solve.get("point")
-
-    if solve_point is not None:
-        solve_point = bxm.closest_point_on_segment(
-            solve_point,
-            vertex_point,
-            middle_other
-        )
-
-    slide_point = slide_boundary_point_on_edge(
-        bm=bm,
-        vertex_id=vertex_id,
-        edge_id=middle_edge_id,
-        distance=0.5 * (width_start + width_end)
-    )
-
-    middle_point = choose_chain_2_multi_middle_point(
-        vertex_point=vertex_point,
-        start_point=start_anchor.co_world,
-        end_point=end_anchor.co_world,
-        solve_point=solve_point,
-        slide_point=slide_point,
-        width=0.5 * (width_start + width_end),
-        vertex_id=vertex_id,
-        gap_role=gap_role,
-        middle_edge_id=middle_edge_id
-    )
-
-    if middle_point is None:
-        return []
-
-    cap_boundaries = []
-
-    start_alias = make_chain_2_multi_cap_alias(
-        source_boundary=start_anchor,
-        boundary_role=gap_role
-    )
-
-    if start_alias is not None:
-        cap_boundaries.append(start_alias)
-
-    middle_boundary = make_chain_2_multi_middle_boundary(
-        vertex_id=vertex_id,
-        selected_edge_id=edge_start_id,
-        edge_before_id=edge_start_id,
-        edge_after_id=edge_end_id,
-        edge_on_id=middle_edge_id,
-        point=middle_point,
-        boundary_role=gap_role,
-        label="MID"
-    )
-
-    if middle_boundary is not None:
-        cap_boundaries.append(middle_boundary)
-
-    end_alias = make_chain_2_multi_cap_alias(
-        source_boundary=end_anchor,
-        boundary_role=gap_role
-    )
-
-    if end_alias is not None:
-        cap_boundaries.append(end_alias)
-
-    cap_boundaries = collapse_boundary_vertices_by_position(
-        cap_boundaries
-    )
-
-    if len(cap_boundaries) < 3:
-        BX_log.warn(
-            "CHAIN_2_MULTI single-gap cap skipped at vertex {0}, role={1}: only {2} unique points.".format(
-                vertex_id,
-                gap_role,
-                len(cap_boundaries)
-            ),
-            channel="summary"
-        )
-        return []
-
-    BX_log.warn(
-        "CHAIN_2_MULTI single-gap cap built at vertex {0}, role={1}: start={2}, middle={3}, end={4}, source={5}, count={6}".format(
-            vertex_id,
-            gap_role,
-            getattr(start_anchor, "id", None),
-            middle_edge_id,
-            getattr(end_anchor, "id", None),
-            solve.get("source", "offset_on_edge_between"),
-            len(cap_boundaries)
-        ),
-        channel="summary"
-    )
-
-    return cap_boundaries
 
 def debug_chain_2_multi_probe_points(boundary_list,
                                      bm,
@@ -1431,173 +1365,6 @@ def find_existing_selected_boundary_for_gap_side(boundary_list,
 
     return None
 
-def make_chain_2_multi_cap_alias(source_boundary,
-                                 boundary_role):
-    """
-    Make a cap-only alias of an existing selected boundary.
-
-    Critical:
-        Reuse source_boundary.id.
-
-    Because BX_BevelTransaction.add_boundary_vertex() deduplicates by
-    boundary_id, this makes the cap share the same transaction vertex as
-    the bevel strip / fallback boundary.
-    """
-
-    if source_boundary is None:
-        return None
-
-    return BX_BoundaryVertex(
-        boundary_id=source_boundary.id,
-        original_vertex_id=source_boundary.original_vertex_id,
-        selected_edge_id=source_boundary.selected_edge_id,
-        face_id=source_boundary.face_id,
-        co_world=source_boundary.co_world,
-        source=CHAIN_2_MULTI_CAP,
-        edge_before_id=getattr(source_boundary, "edge_before_id", None),
-        edge_after_id=getattr(source_boundary, "edge_after_id", None),
-        edge_on_id=getattr(source_boundary, "edge_on_id", None),
-        boundary_role=boundary_role
-    )
-
-def make_chain_2_multi_middle_boundary(vertex_id,
-                                       selected_edge_id,
-                                       edge_before_id,
-                                       edge_after_id,
-                                       edge_on_id,
-                                       point,
-                                       boundary_role,
-                                       label):
-    """
-    Create a new middle/on-edge cap boundary for CHAIN_2_MULTI.
-
-    This is the only new point in the single-middle-edge cap.
-    """
-
-    if point is None:
-        return None
-
-    return BX_BoundaryVertex(
-        boundary_id="BV{0}_CHAIN2_MULTI_{1}_{2}_E{3}".format(
-            vertex_id,
-            boundary_role,
-            label,
-            edge_on_id
-        ),
-        original_vertex_id=vertex_id,
-        selected_edge_id=selected_edge_id,
-        face_id=None,
-        co_world=point,
-        source=CHAIN_2_MULTI_CAP,
-        edge_before_id=edge_before_id,
-        edge_after_id=edge_after_id,
-        edge_on_id=edge_on_id,
-        boundary_role=boundary_role
-    )
-
-def build_chain_2_multi_on_edge_boundaries(bm,
-                                           bevel_vertex,
-                                           boundary_list):
-    """
-    Build ON_EDGE boundary points for every non-selected incident edge
-    around a selected_count == 2 high-valence vertex.
-
-    These are not caps.
-
-    They are face-reconstruction anchors:
-        face sector prev_edge -> vertex -> next_edge
-        becomes:
-        point on prev_edge -> point on next_edge
-    """
-
-    vertex_id = bevel_vertex.vertex_id
-    selected_edges = set(getattr(bevel_vertex, "selected_edges", []))
-    edge_halves = list(getattr(bevel_vertex, "edge_halves", []))
-
-    if not edge_halves:
-        return []
-
-    vertex_point = bm.vertices[vertex_id].co_world
-
-    widths = []
-
-    for boundary_vertex in boundary_list:
-        if getattr(boundary_vertex, "original_vertex_id", None) != vertex_id:
-            continue
-
-        if getattr(boundary_vertex, "selected_edge_id", None) not in selected_edges:
-            continue
-
-        if getattr(boundary_vertex, "face_id", None) is None:
-            continue
-
-        widths.append(
-            bxm.distance(
-                vertex_point,
-                boundary_vertex.co_world
-            )
-        )
-
-    if widths:
-        width = sum(widths) / float(len(widths))
-    else:
-        width = 0.0
-
-    on_edge_boundaries = []
-
-    count = len(edge_halves)
-
-    for i, edge_half in enumerate(edge_halves):
-        edge_id = edge_half.edge_id
-
-        if edge_id in selected_edges:
-            continue
-
-        point = slide_boundary_point_on_edge(
-            bm=bm,
-            vertex_id=vertex_id,
-            edge_id=edge_id,
-            distance=width
-        )
-
-        if point is None:
-            continue
-
-        prev_edge_id = edge_halves[(i - 1) % count].edge_id
-        next_edge_id = edge_halves[(i + 1) % count].edge_id
-
-        boundary_vertex = BX_BoundaryVertex(
-            boundary_id="BV{0}_CHAIN2_MULTI_ON_E{1}".format(
-                vertex_id,
-                edge_id
-            ),
-            original_vertex_id=vertex_id,
-            selected_edge_id=None,
-            face_id=None,
-            co_world=point,
-            source=CHAIN_2_MULTI_ON_EDGE,
-            edge_before_id=prev_edge_id,
-            edge_after_id=next_edge_id,
-            edge_on_id=edge_id,
-            boundary_role="ON_EDGE"
-        )
-
-        on_edge_boundaries.append(boundary_vertex)
-
-    BX_log.warn(
-        "CHAIN_2_MULTI ON_EDGE boundaries built for vertex {0}: edges={1}, count={2}".format(
-            vertex_id,
-            [
-                getattr(boundary_vertex, "edge_on_id", None)
-                for boundary_vertex in on_edge_boundaries
-            ],
-            len(on_edge_boundaries)
-        ),
-        channel="summary"
-    )
-
-    return on_edge_boundaries
-
 def choose_chain_2_multi_middle_point(vertex_point,
                                       start_point,
                                       end_point,
@@ -1715,7 +1482,6 @@ def build_selected_count_2_fallback_boundary_for_vertex(bm,
         rails_by_edge_id=rails_by_edge_id
     )
 
-
 def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_vertices):
     """
     Build boundary vertices for the current selected edge set.
@@ -1805,27 +1571,12 @@ def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_verti
                 bm=bm,
                 bevel_vertex=bevel_vertex
             ):
-                boundary_list = build_chain_2_multi_boundary_for_vertex(
+                boundary_list = build_sector_boundary_for_vertex(
                     bm=bm,
                     bevel_vertex=bevel_vertex,
                     edge_data_by_id=edge_data_by_id,
                     rails_by_edge_id=rails_by_edge_id
                 )
-
-                if not boundary_list:
-                    BX_log.warn(
-                        "CHAIN_2_MULTI returned empty at vertex {0}; falling back.".format(
-                            vertex_id
-                        ),
-                        channel="summary"
-                    )
-
-                    boundary_list = build_selected_count_2_fallback_boundary_for_vertex(
-                        bm=bm,
-                        bevel_vertex=bevel_vertex,
-                        edge_data_by_id=edge_data_by_id,
-                        rails_by_edge_id=rails_by_edge_id
-                    )
 
             else:
                 boundary_list = build_selected_count_2_fallback_boundary_for_vertex(
@@ -1836,6 +1587,93 @@ def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_verti
                 )
 
             vertex_boundaries[vertex_id] = boundary_list
+
+        elif bevel_vertex.selected_count >= 3:
+            edge_ring = get_edge_ring_ids(bevel_vertex)
+
+            # ------------------------------------------------------------
+            # All incident edges selected:
+            #     POLE_N / VMesh pole boundary.
+            #
+            # This must run before SECTOR_BOUNDARY.
+            # A star/pole vertex with every incident edge selected is not a
+            # mixed high-valence sector case.
+            # ------------------------------------------------------------
+            if bevel_vertex.selected_count >= 4 and is_all_incident_edges_selected(
+                bevel_vertex
+            ):
+                from BX_boundary import BX_vmesh
+
+                boundary_list = BX_vmesh.build_pole_n_boundary_for_vertex(
+                    bm=bm,
+                    bevel_vertex=bevel_vertex,
+                    edge_data_by_id=edge_data_by_id,
+                    rails_by_edge_id=rails_by_edge_id,
+                    boundary_class=BX_BoundaryVertex,
+                    link_function=link_boundary_vertices_cyclic
+                )
+
+                BX_log.warn(
+                    "POLE_N boundary routed for vertex {0}: selected_count={1}, ring={2}, count={3}".format(
+                        vertex_id,
+                        bevel_vertex.selected_count,
+                        edge_ring,
+                        len(boundary_list) if boundary_list else 0
+                    ),
+                    channel="summary"
+                )
+
+                vertex_boundaries[vertex_id] = boundary_list
+
+            # ------------------------------------------------------------
+            # Mixed high-valence sector case:
+            #     Some incident edges selected, some unselected.
+            # ------------------------------------------------------------
+            elif len(edge_ring) > bevel_vertex.selected_count:
+                boundary_list = build_sector_boundary_for_vertex(
+                    bm=bm,
+                    bevel_vertex=bevel_vertex,
+                    edge_data_by_id=edge_data_by_id,
+                    rails_by_edge_id=rails_by_edge_id
+                )
+
+                vertex_boundaries[vertex_id] = boundary_list
+
+            # ------------------------------------------------------------
+            # Exactly three selected incident edges, no extras:
+            #     Existing TRI_CAP path.
+            # ------------------------------------------------------------
+            elif bevel_vertex.selected_count == 3:
+                from BX_boundary import BX_vmesh
+
+                boundary_list = BX_vmesh.build_corner_3_tri_cap_boundary_for_vertex(
+                    bm=bm,
+                    bevel_vertex=bevel_vertex,
+                    edge_data_by_id=edge_data_by_id,
+                    rails_by_edge_id=rails_by_edge_id,
+                    boundary_class=BX_BoundaryVertex,
+                    link_function=link_boundary_vertices_cyclic
+                )
+
+                vertex_boundaries[vertex_id] = boundary_list
+
+            # ------------------------------------------------------------
+            # Fallback for selected_count >= 4 without extra edges.
+            # This should usually also be POLE_N.
+            # ------------------------------------------------------------
+            else:
+                from BX_boundary import BX_vmesh
+
+                boundary_list = BX_vmesh.build_pole_n_boundary_for_vertex(
+                    bm=bm,
+                    bevel_vertex=bevel_vertex,
+                    edge_data_by_id=edge_data_by_id,
+                    rails_by_edge_id=rails_by_edge_id,
+                    boundary_class=BX_BoundaryVertex,
+                    link_function=link_boundary_vertices_cyclic
+                )
+
+                vertex_boundaries[vertex_id] = boundary_list
 
         elif bevel_vertex.selected_count == 3:
             from BX_boundary import BX_vmesh
@@ -1851,8 +1689,6 @@ def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_verti
 
             vertex_boundaries[vertex_id] = boundary_list
 
-        # In BX_boundary.py, inside build_boundaries_for_selection(), replace the final
-        # unsupported else branch with this selected_count >= 4 branch plus fallback.
         elif bevel_vertex.selected_count >= 4:
             from BX_boundary import BX_vmesh
 
