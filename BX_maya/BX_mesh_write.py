@@ -336,6 +336,126 @@ def create_debug_cube(name="BX_debug_cube", size=1.0):
 
     return create_mesh_from_pydata(vertices, faces, name=name)
 
+def _get_transform_shapes(transform):
+    """
+    Return non-intermediate mesh shapes under a transform.
+    """
+    shapes = cmds.listRelatives(
+        transform,
+        shapes=True,
+        fullPath=True,
+        noIntermediate=True
+    ) or []
+
+    return [
+        shape for shape in shapes
+        if cmds.nodeType(shape) == "mesh"
+    ]
+
+
+def replace_transform_mesh_from_pydata(transform, vertices, faces, shape_name=None):
+    """
+    Replace the mesh shape under an existing transform using Python mesh data.
+
+    This is the first BevelX local-edit output mode.
+
+    It keeps:
+        - the original transform node
+        - transform position / rotation / scale
+        - object name
+
+    It replaces:
+        - the mesh shape topology
+
+    Args:
+        transform:
+            Maya transform path or name.
+
+        vertices:
+            List of vertex positions in object/local space.
+
+        faces:
+            List of polygon faces using vertex indices.
+
+        shape_name:
+            Optional shape name. If None, uses '<transform>Shape'.
+
+    Returns:
+        dict:
+            {
+                "transform": str,
+                "shape": str,
+                "vertex_count": int,
+                "face_count": int,
+            }
+    """
+    if not transform or not cmds.objExists(transform):
+        raise RuntimeError("Transform does not exist: {}".format(transform))
+
+    transform = cmds.ls(transform, long=True)[0]
+
+    vertices = list(vertices)
+    faces = [list(face) for face in faces]
+
+    _validate_mesh_data(vertices, faces)
+
+    old_shapes = _get_transform_shapes(transform)
+
+    # Delete old mesh shapes under the transform.
+    for shape in old_shapes:
+        try:
+            cmds.delete(shape)
+        except Exception:
+            pass
+
+    points = _as_point_array(vertices)
+    polygon_counts, polygon_connects = _flatten_faces(faces)
+
+    selection_list = om.MSelectionList()
+    selection_list.add(transform)
+    transform_mobject = selection_list.getDependNode(0)
+
+    mesh_fn = om.MFnMesh()
+    mesh_mobject = mesh_fn.create(
+        points,
+        polygon_counts,
+        polygon_connects,
+        parent=transform_mobject
+    )
+
+    # Apply hard face-vertex normals.
+    _set_hard_face_vertex_normals(
+        mesh_mobject=mesh_mobject,
+        vertices=vertices,
+        faces=faces,
+    )
+
+    shape_path = om.MDagPath.getAPathTo(mesh_mobject).fullPathName()
+
+    short_transform_name = transform.split("|")[-1]
+
+    if shape_name is None:
+        shape_name = "{}Shape".format(short_transform_name)
+
+    shape = cmds.rename(shape_path, shape_name)
+
+    transform = cmds.ls(transform, long=True)[0]
+    shape = cmds.ls(shape, long=True)[0]
+
+    # Assign default material for now.
+    try:
+        cmds.sets(transform, edit=True, forceElement="initialShadingGroup")
+    except Exception:
+        pass
+
+    cmds.select(transform, replace=True)
+
+    return {
+        "transform": transform,
+        "shape": shape,
+        "vertex_count": len(vertices),
+        "face_count": len(faces),
+    }
 
 def delete_mesh(transform):
     """

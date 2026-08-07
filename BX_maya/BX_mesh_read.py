@@ -206,6 +206,25 @@ def mesh_vertices_to_pydata(mesh_fn, world_space=False) -> List[List[float]]:
 
     return [[float(point.x), float(point.y), float(point.z)] for point in points]
 
+def mesh_edges_to_pydata(mesh_dag_path):
+    """
+    Read Maya mesh edges in Maya edge-index order.
+
+    This preserves the identity:
+        Maya edge index == BevelX BMEdge.index
+    """
+    edge_it = om.MItMeshEdge(mesh_dag_path)
+
+    edges = []
+
+    while not edge_it.isDone():
+        edges.append([
+            int(edge_it.vertexId(0)),
+            int(edge_it.vertexId(1)),
+        ])
+        edge_it.next()
+
+    return edges
 
 def mesh_faces_to_pydata(mesh_fn) -> List[List[int]]:
     """
@@ -503,6 +522,7 @@ def read_selected_mesh_data(world_space=False, include_selected_edges=True):
         for point in points
     ]
 
+    edges = mesh_edges_to_pydata(dag_path)
     faces = []
     face_normals = []
 
@@ -526,11 +546,11 @@ def read_selected_mesh_data(world_space=False, include_selected_edges=True):
             _get_edge_data(dag_path, edge_index)
             for edge_index in selected_edges
         ]
-
     return {
         "transform": transform,
         "shape": shape,
         "vertices": vertices,
+        "edges": edges,
         "faces": faces,
         "face_normals": face_normals,
         "selected_edges": selected_edges,

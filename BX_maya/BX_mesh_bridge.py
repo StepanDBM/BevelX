@@ -73,34 +73,6 @@ def duplicate_selected_mesh_as_pydata(
         "created": created,
     }
 
-
-def print_bridge_debug(result):
-    """
-    Print debug information for duplicate_selected_mesh_as_pydata().
-    """
-    source = result.get("source", {})
-    created = result.get("created", {})
-
-    print("MayaMeshBridge result")
-
-    print("  source_transform={}".format(source.get("transform")))
-    print("  source_shape={}".format(source.get("shape")))
-    print("  source_vertices={}".format(len(source.get("vertices", []))))
-    print("  source_faces={}".format(len(source.get("faces", []))))
-    print("  source_selected_edges={}".format(source.get("selected_edges", [])))
-
-    print("  created_transform={}".format(created.get("transform")))
-    print("  created_shape={}".format(created.get("shape")))
-    print("  created_vertices={}".format(created.get("vertex_count")))
-    print("  created_faces={}".format(created.get("face_count")))
-
-    selected_edge_data = source.get("selected_edge_data", [])
-
-    for edge_data in selected_edge_data:
-        print("  selected_edge {}".format(edge_data["edge_index"]))
-        print("    vertex_ids={}".format(edge_data["vertex_ids"]))
-        print("    connected_faces={}".format(edge_data["connected_faces"]))
-
 # ---------------------------------------------------------------------------
 # Maya selection -> BevelX pipeline bridge
 # ---------------------------------------------------------------------------
@@ -117,17 +89,17 @@ def _mesh_data_get(mesh_data, key, default=None):
 
 def _mesh_data_to_pydata(mesh_data):
     """
-    Extract vertices, faces, and selected_edges from Maya read mesh_data.
+    Extract vertices, edges, faces, and selected_edges.
 
-    Supports:
-        - dict returned by read_selected_mesh_data()
-        - dataclass returned by read_selected_maya_mesh()
+    Critical:
+        edges must be Maya edge-index order.
     """
     vertices = _mesh_data_get(mesh_data, "vertices", [])
+    edges = _mesh_data_get(mesh_data, "edges", None)
     faces = _mesh_data_get(mesh_data, "faces", [])
     selected_edges = _mesh_data_get(mesh_data, "selected_edges", [])
 
-    return vertices, faces, selected_edges
+    return vertices, edges, faces, selected_edges
 
 def _require_selected_edges(mesh_data):
     selected_edges = _mesh_data_get(mesh_data, "selected_edges", [])
@@ -165,7 +137,7 @@ def debug_selected_mesh_bevel_pipeline(
     from BX_bevelx.BX_bevel_main import debug_bevel_pydata
 
     mesh_data = read_selected_mesh_data(world_space=world_space)
-    vertices, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
+    vertices, edges, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
     selected_edges = _require_selected_edges(mesh_data)
 
     print("-- Source Mesh Normals --")
@@ -176,6 +148,7 @@ def debug_selected_mesh_bevel_pipeline(
 
     lines = debug_bevel_pydata(
         vertices=vertices,
+        edges=edges,
         faces=faces,
         selected_edges=selected_edges,
         width=width,
@@ -218,11 +191,12 @@ def bevel_selected_mesh_to_new_mesh(
     from BX_bevelx.BX_bevel_main import bevel_pydata
 
     mesh_data = read_selected_mesh_data(world_space=world_space)
-    vertices, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
+    vertices, edges, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
     selected_edges = _require_selected_edges(mesh_data)
 
     output_vertices, output_faces = bevel_pydata(
         vertices=vertices,
+        edges=edges,
         faces=faces,
         selected_edges=selected_edges,
         width=width,
@@ -245,24 +219,74 @@ def bevel_selected_mesh_to_new_mesh(
     }
 
 
-def print_bevel_bridge_debug(result):
+
+def bevel_selected_mesh_in_place(
+    world_space=False,
+    width=0.1,
+    segments=1,
+    profile=0.5,
+    **param_overrides
+):
     """
-    Print debug info from bevel_selected_mesh_to_new_mesh().
+    Read selected Maya mesh edges, run BevelX, and replace the original mesh
+    shape under the same transform.
+
+    This is closer to Blender's in-place BMesh bevel behavior than creating
+    a separate result transform.
+    """
+    from BX_bevelx.BX_bevel_main import bevel_pydata
+    from BX_maya.BX_mesh_write import replace_transform_mesh_from_pydata
+
+    mesh_data = read_selected_mesh_data(world_space=world_space)
+
+    selected_edges = _require_selected_edges(mesh_data)
+
+    vertices, edges, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
+
+    output_vertices, output_faces = bevel_pydata(
+        vertices=vertices,
+        edges=edges,
+        faces=faces,
+        selected_edges=selected_edges,
+        width=width,
+        segments=segments,
+        profile=profile,
+        **param_overrides
+    )
+
+    transform = _mesh_data_get(mesh_data, "transform", None)
+
+    if not transform:
+        raise RuntimeError("Could not resolve selected mesh transform.")
+
+    created = replace_transform_mesh_from_pydata(
+        transform=transform,
+        vertices=output_vertices,
+        faces=output_faces,
+    )
+
+    return {
+        "source": mesh_data,
+        "created": created,
+        "output_vertices": output_vertices,
+        "output_faces": output_faces,
+    }
+
+
+def print_in_place_bevel_debug(result):
+    """
+    Print debug info for bevel_selected_mesh_in_place().
     """
     source = result.get("source")
     created = result.get("created", {})
     output_vertices = result.get("output_vertices", [])
     output_faces = result.get("output_faces", [])
 
-    source_vertices = _mesh_data_get(source, "vertices", [])
-    source_faces = _mesh_data_get(source, "faces", [])
-    source_selected_edges = _mesh_data_get(source, "selected_edges", [])
-
-    print("MayaBevelBridge result")
-    print("  source_vertices={}".format(len(source_vertices)))
-    print("  source_faces={}".format(len(source_faces)))
-    print("  source_selected_edges={}".format(source_selected_edges))
+    print("MayaInPlaceBevel result")
+    print("  source_transform={}".format(_mesh_data_get(source, "transform", None)))
+    print("  source_shape={}".format(_mesh_data_get(source, "shape", None)))
+    print("  source_selected_edges={}".format(_mesh_data_get(source, "selected_edges", [])))
     print("  output_vertices={}".format(len(output_vertices)))
     print("  output_faces={}".format(len(output_faces)))
-    print("  created_transform={}".format(created.get("transform")))
-    print("  created_shape={}".format(created.get("shape")))
+    print("  replaced_transform={}".format(created.get("transform")))
+    print("  replaced_shape={}".format(created.get("shape")))

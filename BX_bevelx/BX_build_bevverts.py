@@ -10,40 +10,44 @@ from BX_bevelx.BX_types import BevVert, BevelParams, EdgeHalf
 SelectedEdgeInput = Union[BMEdge, int]
 
 
-def normalize_selected_edges(bm: BMesh,
-                             selected_edges: Iterable[SelectedEdgeInput]) -> Set[BMEdge]:
+def normalize_selected_edges(bm, selected_edges):
     """
-    Convert selected edge inputs into a set of BMEdge objects.
+    Convert selected edge inputs into BMEdge objects.
 
-    Accepted input:
-        - BMEdge objects
-        - edge indices
+    Maya adapter rule:
+        selected int ids are Maya source edge ids.
+        Prefer bm.source_edge_id_to_edge over bm.edges[index].
 
-    Blender's bevel core works with BMEdge pointers. This helper lets the Maya
-    adapter pass stable edge indices while the solver itself uses BMEdge objects.
+    Internal test rule:
+        if source map is not available, fall back to bm.edges[index].
     """
-
     result = set()
 
-    for item in selected_edges:
-        if isinstance(item, BMEdge):
-            result.add(item)
+    source_map = getattr(bm, "source_edge_id_to_edge", {})
+
+    for edge_input in selected_edges:
+        # Already a BMEdge-like object.
+        if hasattr(edge_input, "verts"):
+            result.add(edge_input)
             continue
 
-        edge_index = int(item)
+        edge_id = int(edge_input)
 
-        if edge_index < 0 or edge_index >= len(bm.edges):
-            raise IndexError("selected edge index out of range: {0}".format(edge_index))
+        if edge_id in source_map:
+            result.add(source_map[edge_id])
+            continue
 
-        edge = bm.edges[edge_index]
+        if 0 <= edge_id < len(bm.edges):
+            result.add(bm.edges[edge_id])
+            continue
 
-        if not edge.is_valid:
-            raise ValueError("selected edge is not valid: {0}".format(edge_index))
-
-        result.add(edge)
+        raise IndexError(
+            "Selected edge id {} is not available in source map or bm.edges.".format(
+                edge_id
+            )
+        )
 
     return result
-
 
 def find_bevvert(bp: BevelParams,
                  vert: BMVert) -> Optional[BevVert]:
@@ -506,9 +510,11 @@ def bevel_vert_construct(bm: BMesh,
     params.normalize()
     params.vert_hash.clear()
 
-    selected_edge_set = normalize_selected_edges(bm, selected_edges)
+    selected_edges = normalize_selected_edges(bm, selected_edges)
 
-    for edge in selected_edge_set:
+    params.selected_edges = selected_edges
+
+    for edge in selected_edges:
         ensure_bevvert(params, edge.v1)
         ensure_bevvert(params, edge.v2)
 
@@ -516,7 +522,7 @@ def bevel_vert_construct(bm: BMesh,
         find_bevel_edge_order(
             bm=bm,
             bv=bv,
-            selected_edges=selected_edge_set,
+            selected_edges=selected_edges,
             params=params,
         )
 

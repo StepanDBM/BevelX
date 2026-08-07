@@ -37,6 +37,36 @@ class BevelPipelineResult:
 # Input normalization
 # ---------------------------------------------------------------------------
 
+#temporal
+def debug_selected_bmedge_identity(params):
+    """
+    Debug selected edge identity after BMesh construction.
+
+    This proves:
+        Maya selected edge id -> BMEdge.source_index -> correct BMEdge verts
+    """
+    lines = []
+    lines.append("-- BevelX Selected BMEdges --")
+
+    selected_edges = getattr(params, "selected_edges", [])
+
+    for edge in sorted(selected_edges, key=lambda item: getattr(item, "source_index", getattr(item, "index", -1))):
+        v0 = edge.verts[0]
+        v1 = edge.verts[1]
+
+        lines.append(
+            "BMEdge index={} source_index={} verts=[{}, {}] co0={} co1={}".format(
+                getattr(edge, "index", None),
+                getattr(edge, "source_index", None),
+                getattr(v0, "index", None),
+                getattr(v1, "index", None),
+                getattr(v0, "co", None),
+                getattr(v1, "co", None),
+            )
+        )
+
+    return lines
+
 def normalize_selected_edge_indices(bm: BMesh,
                                     selected_edges: Iterable[Any]) -> List[int]:
     """
@@ -263,6 +293,8 @@ def debug_pipeline_summary(params: BevelParams) -> List[str]:
     """
 
     lines = []
+
+    lines.extend(debug_selected_bmedge_identity(params))
 
     lines.append("-- BevVerts --")
     lines.extend(debug_bevvert_summary(params))

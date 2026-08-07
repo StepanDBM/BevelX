@@ -142,6 +142,10 @@ class BMVert(BMElem):
 class BMEdge(BMElem):
     verts: Tuple[BMVert, BMVert] = field(default_factory=tuple)
 
+    # Original source edge id from Maya, when available.
+    # For Maya mesh input, this should match the Maya edge index.
+    source_index: Optional[int] = None
+
     # Radial loop list around this edge.
     link_loops: List["BMLoop"] = field(default_factory=list)
 
@@ -433,6 +437,18 @@ class BMFaceSeq(BMElemSeq):
 class BMLoopSeq(BMElemSeq):
     pass
 
+# ---------------------------------------------------------------------------
+# BMesh helpers
+# ---------------------------------------------------------------------------
+
+def _edge_key(v0, v1):
+    """
+    Canonical undirected edge key from two BMVert objects.
+
+    Used to make sure face construction reuses explicit source edges
+    instead of creating duplicate inferred edges.
+    """
+    return tuple(sorted((v0.index, v1.index)))
 
 # ---------------------------------------------------------------------------
 # BMesh
@@ -459,6 +475,9 @@ class BMesh:
         self.edges = BMEdgeSeq()
         self.faces = BMFaceSeq()
         self.loops = BMLoopSeq()
+        # Maya source edge id -> BMEdge object.
+        # This preserves external Maya selection identity.
+        self.source_edge_id_to_edge = {}
 
         self.select_mode = {"VERT", "EDGE", "FACE"}
         self.select_history = []
@@ -480,28 +499,47 @@ class BMesh:
         self.verts.append(vert)
         return vert
 
-    def edges_new(self, verts: Sequence[BMVert], example: Optional[BMEdge] = None) -> BMEdge:
+    def edges_new(self,
+                verts: Sequence[BMVert],
+                example: Optional[BMEdge] = None,
+                source_index: Optional[int] = None) -> BMEdge:
         if len(verts) != 2:
             raise ValueError("BMEdge requires exactly two verts")
 
         v1, v2 = verts
+
         existing = self.edges.get((v1, v2), None)
 
         if existing is not None:
+            if source_index is not None:
+                existing.source_index = int(source_index)
+                self.source_edge_id_to_edge[int(source_index)] = existing
+
             return existing
 
-        edge = BMEdge(verts=(v1, v2))
+        edge = BMEdge(
+            verts=(v1, v2),
+            source_index=int(source_index) if source_index is not None else None,
+        )
 
         if example is not None:
             edge.copy_from(example)
             edge.seam = example.seam
             edge.smooth = example.smooth
 
+            example_source_index = getattr(example, "source_index", None)
+            if example_source_index is not None:
+                edge.source_index = int(example_source_index)
+
         edge.index = len(self.edges)
         self.edges.append(edge)
 
         v1.link_edges.append(edge)
         v2.link_edges.append(edge)
+
+        if edge.source_index is not None:
+            self.source_edge_id_to_edge[int(edge.source_index)] = edge
+
         return edge
 
     def faces_new(self, verts: Sequence[BMVert], example: Optional[BMFace] = None) -> BMFace:
@@ -546,9 +584,6 @@ class BMesh:
     # Blender-like aliases.
     def vert_new(self, co=(0.0, 0.0, 0.0), example: Optional[BMVert] = None) -> BMVert:
         return self.verts_new(co=co, example=example)
-
-    def edge_new(self, verts: Sequence[BMVert], example: Optional[BMEdge] = None) -> BMEdge:
-        return self.edges_new(verts=verts, example=example)
 
     def face_new(self, verts: Sequence[BMVert], example: Optional[BMFace] = None) -> BMFace:
         return self.faces_new(verts=verts, example=example)
@@ -880,18 +915,70 @@ class BMesh:
         faces: Optional[Sequence[Sequence[int]]] = None,
     ) -> "BMesh":
         bm = cls()
-        bm_verts = [bm.verts_new(co) for co in vertices]
 
+        bm_verts = [
+            bm.verts_new(co)
+            for co in vertices
+        ]
+
+        # Create explicit edges in Maya edge-index order.
+        # This preserves Maya edge id as BMEdge.source_index.
         if edges:
-            for edge_indices in edges:
-                bm.edges_new((bm_verts[edge_indices[0]], bm_verts[edge_indices[1]]))
+            for source_edge_index, edge_indices in enumerate(edges):
+                bm.edges_new(
+                    (
+                        bm_verts[int(edge_indices[0])],
+                        bm_verts[int(edge_indices[1])],
+                    ),
+                    source_index=source_edge_index,
+                )
 
+        # Faces must reuse the explicit edges above.
+        # faces_new() calls edges_new(), and edges_new() returns an existing edge
+        # when the same vertex pair already exists.
         if faces:
             for face_indices in faces:
-                bm.faces_new([bm_verts[index] for index in face_indices])
+                bm.faces_new([
+                    bm_verts[int(index)]
+                    for index in face_indices
+                ])
 
         bm.normal_update()
         bm.index_update()
+
+        # Hard identity check:
+        # Make sure every Maya source edge still maps to the same vertex pair.
+        if edges:
+            for source_edge_index, edge_indices in enumerate(edges):
+                edge = bm.source_edge_id_to_edge.get(source_edge_index)
+
+                if edge is None:
+                    raise RuntimeError(
+                        "Missing source edge mapping for Maya edge {}".format(
+                            source_edge_index
+                        )
+                    )
+
+                expected = tuple(sorted((
+                    int(edge_indices[0]),
+                    int(edge_indices[1]),
+                )))
+
+                actual = tuple(sorted((
+                    int(edge.verts[0].index),
+                    int(edge.verts[1].index),
+                )))
+
+                if expected != actual:
+                    raise RuntimeError(
+                        "Source edge mapping mismatch for Maya edge {}: "
+                        "expected verts {} but got verts {}".format(
+                            source_edge_index,
+                            expected,
+                            actual,
+                        )
+                    )
+
         return bm
 
     def to_pydata(self):
