@@ -34,6 +34,35 @@ def copy_v3(v) -> List[float]:
 def zero_v3() -> List[float]:
     return [0.0, 0.0, 0.0]
 
+def _vec_add(a, b):
+    return [
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+    ]
+
+
+def _vec_dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _vec_len(v):
+    return (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+
+
+def _vec_normalize(v):
+    length = _vec_len(v)
+
+    if length <= 1.0e-12:
+        return None
+
+    return [
+        v[0] / length,
+        v[1] / length,
+        v[2] / length,
+    ]
+
+
 
 def add_v3v3(a, b) -> List[float]:
     return [

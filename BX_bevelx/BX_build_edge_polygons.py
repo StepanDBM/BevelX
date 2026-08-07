@@ -9,13 +9,18 @@ from BX_bevelx.BX_types import (
     BevVert,
     BoundVert,
     EdgeHalf,
-    NewVert,
+    NewVert
 )
 from BX_bevelx.BX_build_bevverts import (
     find_bevvert,
     find_edge_half,
 )
-from BX_bevelx.BX_math_utils import copy_v3
+from BX_bevelx.BX_math_utils import (
+    copy_v3,
+    _vec_add,
+    _vec_dot,
+    _vec_normalize
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +133,85 @@ def can_build_edge_polygon(edge_half_a: EdgeHalf,
 # Polygon construction
 # ---------------------------------------------------------------------------
 
+
+def _newell_normal_from_newverts(newverts):
+    """
+    Compute polygon normal from NewVert list using emitted winding.
+    """
+    if not newverts or len(newverts) < 3:
+        return None
+
+    nx = 0.0
+    ny = 0.0
+    nz = 0.0
+
+    count = len(newverts)
+
+    for i in range(count):
+        current = newverts[i].co
+        nxt = newverts[(i + 1) % count].co
+
+        nx += (current[1] - nxt[1]) * (current[2] + nxt[2])
+        ny += (current[2] - nxt[2]) * (current[0] + nxt[0])
+        nz += (current[0] - nxt[0]) * (current[1] + nxt[1])
+
+    return _vec_normalize([nx, ny, nz])
+
+
+def _expected_normal_from_source_edge(edge):
+    """
+    Expected bevel face normal from the selected source edge.
+
+    For a normal manifold edge, this is the normalized average of the two
+    adjacent source face normals.
+
+    For boundary/non-manifold cases, use whatever source face normals exist.
+    """
+    if edge is None:
+        return None
+
+    faces = getattr(edge, "link_faces", []) or []
+    normal_sum = [0.0, 0.0, 0.0]
+
+    valid_count = 0
+
+    for face in faces:
+        normal = getattr(face, "normal", None)
+
+        if normal is None:
+            continue
+
+        normal_sum = _vec_add(normal_sum, normal)
+        valid_count += 1
+
+    if valid_count == 0:
+        return None
+
+    return _vec_normalize(normal_sum)
+
+
+def orient_edge_polygon_newverts_to_source_edge(newverts, edge):
+    """
+    Orient generated edge polygon winding to match the selected source edge.
+
+    This fixes cases where the same left/right construction order creates an
+    inward bevel face for some edges depending on source edge orientation.
+    """
+    expected_normal = _expected_normal_from_source_edge(edge)
+
+    if expected_normal is None:
+        return newverts
+
+    actual_normal = _newell_normal_from_newverts(newverts)
+
+    if actual_normal is None:
+        return newverts
+
+    if _vec_dot(actual_normal, expected_normal) < 0.0:
+        newverts.reverse()
+
+    return newverts
+
 def edge_polygon_newverts(edge_half_a: EdgeHalf,
                           edge_half_b: EdgeHalf) -> List[NewVert]:
     """
@@ -184,7 +268,10 @@ def build_edge_polygon_for_edge(params: BevelParams, edge) -> Optional[EdgePolyg
         edge_half_a=edge_half_a,
         edge_half_b=edge_half_b,
     )
-
+    newverts = orient_edge_polygon_newverts_to_source_edge(
+        newverts=newverts,
+        edge=edge,
+    )
     return EdgePolygon(
         edge=edge,
         edge_half_a=edge_half_a,

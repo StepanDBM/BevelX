@@ -18,6 +18,8 @@ from __future__ import annotations
 from BX_maya.BX_mesh_read import read_selected_mesh_data
 from BX_maya.BX_mesh_write import create_mesh_from_pydata
 
+from BX_maya.BX_undo import undo_chunk
+
 
 def duplicate_selected_mesh_as_pydata(
     name="BX_duplicate_test",
@@ -165,61 +167,7 @@ def debug_selected_mesh_bevel_pipeline(
         "debug_lines": lines,
     }
 
-
-def bevel_selected_mesh_to_new_mesh(
-    name="BX_bevel_result",
-    world_space=False,
-    width=0.1,
-    segments=1,
-    profile=0.5,
-    **param_overrides
-):
-    """
-    Read selected Maya mesh, run the BevelX pydata bevel pipeline,
-    and create a new Maya mesh from the result.
-
-    This is the first real Maya -> BevelX -> Maya bridge.
-
-    Returns:
-        {
-            "source": mesh_data,
-            "created": created_mesh_result,
-            "output_vertices": [...],
-            "output_faces": [...],
-        }
-    """
-    from BX_bevelx.BX_bevel_main import bevel_pydata
-
-    mesh_data = read_selected_mesh_data(world_space=world_space)
-    vertices, edges, faces, selected_edges = _mesh_data_to_pydata(mesh_data)
-    selected_edges = _require_selected_edges(mesh_data)
-
-    output_vertices, output_faces = bevel_pydata(
-        vertices=vertices,
-        edges=edges,
-        faces=faces,
-        selected_edges=selected_edges,
-        width=width,
-        segments=segments,
-        profile=profile,
-        **param_overrides
-    )
-
-    created = create_mesh_from_pydata(
-        vertices=output_vertices,
-        faces=output_faces,
-        name=name
-    )
-
-    return {
-        "source": mesh_data,
-        "created": created,
-        "output_vertices": output_vertices,
-        "output_faces": output_faces,
-    }
-
-
-
+@undo_chunk("BevelX Apply Local")
 def bevel_selected_mesh_in_place(
     world_space=False,
     width=0.1,

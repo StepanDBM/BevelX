@@ -93,7 +93,7 @@ def apply_selected_bevel(name="BX_bevel_result",
     print("[BevelX]   profile={}".format(profile))
     print("[BevelX]   world_space={}".format(world_space))
 
-    result = BX_mesh_bridge.bevel_selected_mesh_to_new_mesh(
+    result = BX_mesh_bridge.bevel_selected_mesh_in_place(
         name=name,
         world_space=world_space,
         width=width,
