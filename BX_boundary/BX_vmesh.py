@@ -171,6 +171,42 @@ def get_selected_edges_using_face(bm, selected_edge_ids, face_id):
 
     return result
 
+def get_boundvert_point_from_two_face_rails(prev_rail,
+                                            current_rail,
+                                            fallback_prev_point,
+                                            fallback_current_point):
+    """
+    Return the BoundVert point between two beveled edges on one shared face.
+
+    Blender-lane behavior:
+        The boundary point between two beveled edges is the meet/intersection
+        of the two offset rails on the shared face.
+
+    Do not average the rail endpoints as the primary behavior.
+    Averaging pulls the BoundVert inward and causes connected F_EDGE faces
+    to look non-straight.
+    """
+
+    if prev_rail is None or current_rail is None:
+        return bxm.midpoint(
+            fallback_prev_point,
+            fallback_current_point
+        )
+
+    point = bxm.line_line_intersection_midpoint(
+        prev_rail[0],
+        prev_rail[1],
+        current_rail[0],
+        current_rail[1]
+    )
+
+    if point is None:
+        return bxm.midpoint(
+            fallback_prev_point,
+            fallback_current_point
+        )
+
+    return point
 
 def get_rail_for_face(rails, face_id):
     """
@@ -326,13 +362,15 @@ def build_pole_n_boundary_for_vertex(bm,
         prev_point = get_rail_endpoint_for_pole_vertex(
             edge_data=edge_data_by_id.get(prev_edge_id),
             rail=prev_rail,
-            vertex_id=vertex_id
+            vertex_id=vertex_id,
+            bm=bm
         )
 
         current_point = get_rail_endpoint_for_pole_vertex(
             edge_data=edge_data_by_id.get(current_edge_id),
             rail=current_rail,
-            vertex_id=vertex_id
+            vertex_id=vertex_id,
+            bm=bm
         )
 
         if prev_point is None or current_point is None:
@@ -340,9 +378,17 @@ def build_pole_n_boundary_for_vertex(bm,
                     vertex_id, face_id), channel="caps")
             return []
 
-        # First simple pole point: average the two offset rail endpoints on the shared face.
-        # This is stable for segments=1 and avoids introducing another intersection solver yet.
-        point = bxm.midpoint(prev_point, current_point)
+        # Blender's BoundVert point:
+        # use the intersection / meet of the two offset rails on the shared face.
+        # Used to average endpoint but that pulls the pole point inward because for offset 0.1.
+        # POLE_N midpoint method takes the two rail endpoints near the original vertex:
+        # (0.1, 0.0) and (0.0, 0.1) => (0.05, 0.05) which is inside the original corner.
+        point = get_boundvert_point_from_two_face_rails(
+            prev_rail=prev_rail,
+            current_rail=current_rail,
+            fallback_prev_point=prev_point,
+            fallback_current_point=current_point
+        )
 
         boundary_vertex = boundary_class(
             boundary_id="BV{0}_POLE_N_F{1}".format(vertex_id, face_id),
@@ -362,22 +408,34 @@ def build_pole_n_boundary_for_vertex(bm,
 
     return boundary_list
 
-
-def get_rail_endpoint_for_pole_vertex(edge_data, rail, vertex_id):
+def get_rail_endpoint_for_pole_vertex(edge_data, rail, vertex_id, bm=None):
     """
     Return the endpoint of a rail tuple that corresponds to vertex_id.
 
-    rail is expected to be:
-        (rail_p0, rail_p1)
-
-    This matches BX_boundary.get_rail_for_face(), which returns rail_data["rail"].
+    Prefer distance to the original vertex when bm is available.
+    This avoids relying on Maya edge/rail endpoint ordering.
     """
+
+    if rail is None:
+        return None
+
+    rail_p0, rail_p1 = rail
+
+    if bm is not None:
+        vertex_point = bm.vertices[vertex_id].co_world
+
+        d0 = bxm.distance_sq(vertex_point, rail_p0)
+        d1 = bxm.distance_sq(vertex_point, rail_p1)
+
+        if d0 <= d1:
+            return rail_p0
+
+        return rail_p1
 
     if edge_data is None:
         return None
 
     edge_v0, edge_v1 = edge_data["vertex_ids"]
-    rail_p0, rail_p1 = rail
 
     if vertex_id == edge_v0:
         return rail_p0
