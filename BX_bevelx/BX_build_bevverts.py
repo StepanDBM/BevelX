@@ -527,6 +527,53 @@ def iter_bevverts(params: BevelParams):
     for vert in sorted(params.vert_hash.keys(), key=lambda item: item.index):
         yield params.vert_hash[vert]
 
+def debug_edgehalf_ring_detailed(params: BevelParams) -> List[str]:
+    """
+    Detailed EdgeHalf ring debug.
+
+    Use this before touching normals or winding code.
+    """
+    lines = []
+    lines.append("-- EdgeHalf Rings Detailed --")
+
+    for vert in sorted(params.vert_hash.keys(), key=lambda item: item.index):
+        bevvert = params.vert_hash[vert]
+
+        lines.append(
+            "BevVert vert={} co={} edgecount={} selcount={}".format(
+                getattr(vert, "index", None),
+                getattr(vert, "co", None),
+                bevvert.edgecount,
+                bevvert.selcount,
+            )
+        )
+
+        for i, edge_half in enumerate(bevvert.edges):
+            edge = edge_half.e
+            other = edge.other_vert(vert) if hasattr(edge, "other_vert") else None
+
+            fprev = edge_half.fprev
+            fnext = edge_half.fnext
+
+            lines.append(
+                "  EH {} edge={} other={} is_bev={} prev={} next={} "
+                "fprev={} fprev_no={} fnext={} fnext_no={}".format(
+                    i,
+                    getattr(edge, "index", None),
+                    getattr(other, "index", None),
+                    edge_half.is_bev,
+                    getattr(getattr(edge_half, "prev", None), "e", None).index
+                    if getattr(edge_half, "prev", None) is not None else None,
+                    getattr(getattr(edge_half, "next", None), "e", None).index
+                    if getattr(edge_half, "next", None) is not None else None,
+                    getattr(fprev, "index", None),
+                    getattr(fprev, "normal", None),
+                    getattr(fnext, "index", None),
+                    getattr(fnext, "normal", None),
+                )
+            )
+
+    return lines
 
 def debug_bevvert_summary(params: BevelParams) -> List[str]:
     lines = []

@@ -309,11 +309,14 @@ def debug_emit_summary(params, epsilon=1.0e-9):
         source = output.face_sources[index] if index < len(output.face_sources) else {}
         coords = [output.vertices[i] for i in face]
 
+        normal = emitted_face_normal(coords)
+        
         lines.append(
-            "EmitFace index={0} kind={1} verts={2} coords={3}".format(
+            "EmitFace index={0} kind={1} verts={2} normal={3}coords={4}".format(
                 index,
                 source.get("kind"),
                 face,
+                normal,
                 coords,
             )
         )
@@ -380,3 +383,63 @@ def emit_to_maya_mesh(params,
         pass
 
     return mesh_object
+
+
+# ---------------------------------------------------------------------------
+# Normal detection helpers
+# ---------------------------------------------------------------------------
+def _sub(a, b):
+    return [
+        a[0] - b[0],
+        a[1] - b[1],
+        a[2] - b[2],
+    ]
+
+
+def _cross(a, b):
+    return [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+
+
+def _length(v):
+    return (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+
+
+def _normalize(v):
+    length = _length(v)
+
+    if length <= 1.0e-12:
+        return [0.0, 0.0, 0.0]
+
+    return [
+        v[0] / length,
+        v[1] / length,
+        v[2] / length,
+    ]
+
+
+def emitted_face_normal(coords):
+    """
+    Compute a Newell-style normal for emitted debug faces.
+    """
+    if len(coords) < 3:
+        return [0.0, 0.0, 0.0]
+
+    nx = 0.0
+    ny = 0.0
+    nz = 0.0
+
+    count = len(coords)
+
+    for i in range(count):
+        current = coords[i]
+        nxt = coords[(i + 1) % count]
+
+        nx += (current[1] - nxt[1]) * (current[2] + nxt[2])
+        ny += (current[2] - nxt[2]) * (current[0] + nxt[0])
+        nz += (current[0] - nxt[0]) * (current[1] + nxt[1])
+
+    return _normalize([nx, ny, nz])

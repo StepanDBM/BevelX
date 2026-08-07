@@ -6,7 +6,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from BX_bevelx.BX_mesh_model import BMesh
 from BX_bevelx.BX_types import BevelParams
-from BX_bevelx.BX_build_bevverts import bevel_vert_construct, debug_bevvert_summary
+from BX_bevelx.BX_build_bevverts import (
+    bevel_vert_construct,
+    debug_bevvert_summary,
+    debug_edgehalf_ring_detailed
+)
 from BX_bevelx.BX_build_boundverts import build_boundverts, debug_boundvert_summary, debug_edgehalf_boundverts
 from BX_bevelx.BX_build_vmesh import build_vmeshes, debug_vmesh_summary
 from BX_bevelx.BX_build_edge_polygons import build_edge_polygons, debug_edge_polygon_summary

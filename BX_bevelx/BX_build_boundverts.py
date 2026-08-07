@@ -10,6 +10,7 @@ from BX_bevelx.BX_constants import (
 )
 from BX_bevelx.BX_math_utils import (
     copy_v3,
+    point_on_edgehalf_from_bevvert,
     solve_offset_meet_for_edgehalves,
 )
 from BX_bevelx.BX_types import (
@@ -206,6 +207,129 @@ def set_vmesh_kind_for_bevvert(bevvert: BevVert, params: BevelParams) -> str:
     return vm.mesh_kind
 
 
+def first_beveled_edgehalf(bevvert: BevVert) -> Optional[EdgeHalf]:
+    """
+    Blender-style helper:
+    Return the first beveled EdgeHalf in this BevVert ring.
+
+    Equivalent idea to Blender's next_bev(bv, NULL).
+    """
+    for edge_half in iter_edgehalf_ring(bevvert):
+        if edge_half.is_bev:
+            return edge_half
+
+    return None
+
+def build_terminal_edge_boundverts(params: BevelParams,
+                                   bevvert: BevVert,
+                                   selected_half: EdgeHalf) -> VMesh:
+    """
+    Blender-style terminal-edge boundary construction.
+
+    Case:
+        One selected/beveled edge enters this vertex.
+
+    Blender's build_boundary_terminal_edge() uses the two non-selected support
+    sides around the selected edge. The two BoundVerts should not be generated
+    by sliding along the selected edge itself.
+
+    For selected edge S:
+
+        previous_half -> S -> next_half
+
+    The two boundary points should be:
+
+        point on previous_half
+        point on next_half
+
+    not:
+
+        point on previous_half
+        point on selected_half
+
+    This is the bug that made the cube bevel move along only one wall.
+    """
+    vm = bevvert.vmesh
+    vm.seg = params.seg
+
+    previous_half = selected_half.prev
+    next_half = selected_half.next
+
+    if previous_half is None or next_half is None:
+        vm.count = 0
+        vm.mesh_kind = M_NONE
+        return vm
+
+    # ------------------------------------------------------------------
+    # Left side of selected edge:
+    # Use previous non-selected/support edge.
+    # ------------------------------------------------------------------
+    left_co = point_on_edgehalf_from_bevvert(
+        params=params,
+        bevvert=bevvert,
+        edge_half=previous_half
+    )
+
+    left_boundvert = new_boundvert_on_vmesh(
+        bevvert=bevvert,
+        co=left_co
+    )
+
+    left_boundvert.efirst = previous_half
+    left_boundvert.elast = selected_half
+    left_boundvert.eon = previous_half
+    left_boundvert.ebev = selected_half
+
+    initialize_boundvert_profile(
+        boundvert=left_boundvert,
+        params=params
+    )
+
+    selected_half.leftv = left_boundvert
+
+    # This support edge touches this BoundVert.
+    if previous_half.is_bev:
+        previous_half.rightv = left_boundvert
+    else:
+        previous_half.rightv = left_boundvert
+
+    # ------------------------------------------------------------------
+    # Right side of selected edge:
+    # Use next non-selected/support edge.
+    # ------------------------------------------------------------------
+    right_co = point_on_edgehalf_from_bevvert(
+        params=params,
+        bevvert=bevvert,
+        edge_half=next_half
+    )
+
+    right_boundvert = new_boundvert_on_vmesh(
+        bevvert=bevvert,
+        co=right_co
+    )
+
+    right_boundvert.efirst = selected_half
+    right_boundvert.elast = next_half
+    right_boundvert.eon = next_half
+    right_boundvert.ebev = selected_half
+
+    initialize_boundvert_profile(
+        boundvert=right_boundvert,
+        params=params
+    )
+
+    selected_half.rightv = right_boundvert
+
+    if next_half.is_bev:
+        next_half.leftv = right_boundvert
+    else:
+        next_half.leftv = right_boundvert
+
+    vm.count = 2
+    vm.mesh_kind = M_NONE
+
+    return vm
+
 def build_boundverts_for_bevvert(params: BevelParams, bevvert: BevVert) -> VMesh:
     """
     Build the circular BoundVert ring for one BevVert.
@@ -224,7 +348,18 @@ def build_boundverts_for_bevvert(params: BevelParams, bevvert: BevVert) -> VMesh
         return bevvert.vmesh
 
     edge_count = len(bevvert.edges)
+    # Blender special case:
+    # Only one beveled edge enters this vertex.
+    # Do not use the generic sector builder here.
+    if bevvert.selcount == 1:
+        selected_half = first_beveled_edgehalf(bevvert)
 
+        if selected_half is not None:
+            return build_terminal_edge_boundverts(
+                params=params,
+                bevvert=bevvert,
+                selected_half=selected_half,
+            )
     for index in range(edge_count):
         previous_half = bevvert.edges[index]
         current_half = bevvert.edges[(index + 1) % edge_count]
