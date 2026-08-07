@@ -6,6 +6,17 @@ from BX_math import BX_math as bxm
 from BX_math import BX_offset
 from BX_profile import BX_log
 
+# New Blender-aligned boundary-ring engine.
+# Disabled by default while transaction/cap consumption is migrated.
+# Flip USE_BOUNDVERT_RING_BOUNDARY to True only for controlled A/B tests.
+try:
+    from BX_boundary import BX_boundvert
+except Exception:
+    BX_boundvert = None
+
+USE_BOUNDVERT_RING_BOUNDARY = True
+BOUNDVERT_RING_FALLBACK_TO_LEGACY = True
+
 SECTOR_BOUNDARY = "SECTOR_BOUNDARY"
 
 class BX_BoundaryVertex(object):
@@ -1482,6 +1493,37 @@ def build_selected_count_2_fallback_boundary_for_vertex(bm,
         rails_by_edge_id=rails_by_edge_id
     )
 
+
+def build_boundvert_ring_boundary_for_vertex(bm,
+                                             bevel_vertex,
+                                             edge_data_by_id,
+                                             rails_by_edge_id):
+    """
+    Controlled bridge into BX_boundvert.py.
+
+    This is the Blender-aligned boundary-ring path:
+        BevVertex / EdgeHalf ring -> BoundVert ring
+
+    It deliberately does not route by CORNER_2 / TRI_CAP / TERMINAL_MULTI /
+    POLE_N labels. If it fails or returns no ring, legacy code may still handle
+    the vertex while the migration is incomplete.
+    """
+
+    if BX_boundvert is None:
+        BX_log.warn(
+            "BOUNDVERT_RING unavailable: BX_boundvert module did not import.",
+            channel="summary"
+        )
+        return []
+
+    return BX_boundvert.build_boundvert_ring_for_vertex(
+        bm=bm,
+        bevel_vertex=bevel_vertex,
+        edge_data_by_id=edge_data_by_id,
+        rails_by_edge_id=rails_by_edge_id,
+        settings=None
+    )
+
 def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_vertices):
     """
     Build boundary vertices for the current selected edge set.
@@ -1504,6 +1546,29 @@ def build_boundaries_for_selection(bm, edges_data, rails_by_edge_id, bevel_verti
     }
 
     for vertex_id, bevel_vertex in bevel_vertices.items():
+        if USE_BOUNDVERT_RING_BOUNDARY:
+            boundary_list = build_boundvert_ring_boundary_for_vertex(
+                bm=bm,
+                bevel_vertex=bevel_vertex,
+                edge_data_by_id=edge_data_by_id,
+                rails_by_edge_id=rails_by_edge_id
+            )
+
+            if boundary_list:
+                vertex_boundaries[vertex_id] = boundary_list
+                continue
+
+            if not BOUNDVERT_RING_FALLBACK_TO_LEGACY:
+                vertex_boundaries[vertex_id] = []
+                continue
+
+            BX_log.warn(
+                "BOUNDVERT_RING returned empty at vertex {0}; falling back to legacy boundary routing.".format(
+                    vertex_id
+                ),
+                channel="summary"
+            )
+
         if bevel_vertex.selected_count == 1:
             selected_edge_id = bevel_vertex.selected_edges[0]
 
@@ -1912,7 +1977,8 @@ def build_terminal_multi_offset_meet_point(bm,
                                            adjacent_edge_id,
                                            width,
                                            fallback_point=None,
-                                           debug_label=""):
+                                           debug_label="",
+                                           face_id=None):
     """
     Build a TERMINAL_MULTI selected-side point on adjacent_edge_id.
 
@@ -1961,13 +2027,17 @@ def build_terminal_multi_offset_meet_point(bm,
     if selected_other is None or adjacent_other is None:
         return fallback_point
 
-    vertex_normal = average_terminal_multi_vertex_normal(
-        bm=bm,
-        vertex_id=vertex_id
-    )
+    if face_id is not None and face_id in bm.faces:
+        vertex_normal = list(bm.faces[face_id].normal_world)
+    else:
+        vertex_normal = average_terminal_multi_vertex_normal(
+            bm=bm,
+            vertex_id=vertex_id
+        )
 
     if bxm.is_zero(vertex_normal):
         vertex_normal = [0.0, 1.0, 0.0]
+
 
     candidate_specs = [
         {
@@ -2069,18 +2139,42 @@ def build_terminal_multi_offset_meet_point(bm,
     # This avoids choosing a huge overhanging solve when the opposite orientation
     # also gives a sane local point.
     best = min(
-        valid_candidates,
-        key=lambda item: abs(item["distance"] - width)
-    )
+            valid_candidates,
+            key=lambda item: abs(item["distance"] - width)
+        )
+        # Guard against wrong-face / wrong-normal terminal solves.
+    # Blender solves this with exact EdgeHalf/face ownership.
+    # BevelX currently has weaker face ownership, so reject severe overshoot
+    # when we have a safe selected-edge rail fallback.
+    if fallback_point is not None and width > bxm.EPSILON:
+        max_reasonable_distance = width * 1.35
+
+        if best["distance"] > max_reasonable_distance:
+            BX_log.warn(
+                "TERMINAL_MULTI meet rejected at vertex {0}, side={1}, selected_edge={2}, adjacent_edge={3}, face={4}: distance={5}, width={6}; using rail fallback.".format(
+                    vertex_id,
+                    debug_label,
+                    selected_edge_id,
+                    adjacent_edge_id,
+                    face_id,
+                    best["distance"],
+                    width
+                ),
+                channel="summary"
+            )
+
+            return fallback_point
 
     BX_log.warn(
-        "TERMINAL_MULTI meet used at vertex {0}, side={1}, selected_edge={2}, adjacent_edge={3}, method={4}, distance={5}".format(
+        "TERMINAL_MULTI meet used at vertex {0}, side={1}, selected_edge={2}, adjacent_edge={3}, face={4}, method={5}, distance={6}, width={7}".format(
             vertex_id,
             debug_label,
             selected_edge_id,
             adjacent_edge_id,
+            face_id,
             best["name"],
-            best["distance"]
+            best["distance"],
+            width
         ),
         channel="summary"
     )
@@ -2195,7 +2289,8 @@ def build_terminal_multi_edge_boundary_for_vertex(bm,
         adjacent_edge_id=prev_edge_id,
         width=width,
         fallback_point=rail_point_left,
-        debug_label="LEFT"
+        debug_label="LEFT",
+        face_id=face_prev_selected
     )
 
     if point_left is not None:
@@ -2228,7 +2323,8 @@ def build_terminal_multi_edge_boundary_for_vertex(bm,
         adjacent_edge_id=next_edge_id,
         width=width,
         fallback_point=rail_point_right,
-        debug_label="RIGHT"
+        debug_label="RIGHT",
+        face_id=face_selected_next
     )
 
     if point_right is not None:

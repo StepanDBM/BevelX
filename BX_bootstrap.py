@@ -37,9 +37,11 @@ MODULES_TO_RELOAD = [
     # Profile system
     "BX_profile.BX_profile",
     # Boundary / corner systems
-    "BX_boundary.BX_boundary",
+    #"BX_boundary.BX_boundary",
+    "BX_boundary.BX_boundvert",
     "BX_boundary.BX_miter",
-    "BX_boundary.BX_vmesh",
+    #"BX_boundary.BX_vmesh",
+    "BX_boundary.BX_vmesh_runtime",
     # Geometry creation / reconstruction
     "BX_build.BX_transaction",
     "BX_build.BX_build",

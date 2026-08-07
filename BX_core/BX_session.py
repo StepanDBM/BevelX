@@ -23,6 +23,7 @@ import maya.cmds as cmds
 from BX_core import BX_settings
 from BX_mesh import BX_mesh
 from BX_boundary import BX_boundary
+from BX_boundary import BX_boundvert
 from BX_build import BX_transaction
 from BX_profile import BX_audit
 from BX_profile import BX_log
@@ -335,7 +336,7 @@ def start_or_rebuild_session(settings=None, rail_builder=None):
         # ---------------------------------------------------------------------
         # Build shared boundary data for the whole selection.
         # ---------------------------------------------------------------------
-        selection_boundaries = BX_boundary.build_boundaries_for_selection(
+        selection_boundaries = BX_boundvert.build_boundaries_for_selection(
             bm=session.bm,
             edges_data=session.edges_data,
             rails_by_edge_id=session.rails_by_edge_id,
@@ -355,14 +356,13 @@ def start_or_rebuild_session(settings=None, rail_builder=None):
         # ---------------------------------------------------------------------
         # Unsupported topology.
         # ---------------------------------------------------------------------
-        if unsupported_reason:
-            session.selection_transaction = None
-            session.transactions_by_edge_id = {}
-
-            session.last_error = unsupported_reason
-            session.active = True
-
-            return session
+        if not BX_transaction.boundaries_are_all_boundvert(selection_boundaries):
+            reason = BX_boundary.get_unsupported_boundary_reason(
+                selection_boundaries,
+                vertex_boundaries=selection_boundaries
+            )
+            if reason:
+                raise RuntimeError(reason)
 
         # ---------------------------------------------------------------------
         # Multi-edge / shared selection transaction path.

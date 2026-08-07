@@ -53,15 +53,3 @@ def build_bevel_vertices_from_bmesh(bm):
     """
 
     return BX_bevelVertex.build_bevel_vertices_from_bmesh(bm)
-
-
-def debug_bevel_vertices_from_bmesh(bm):
-    """
-    Build and print BevelVertex objects from an existing BX_BMesh.
-    """
-
-    bevel_vertices = build_bevel_vertices_from_bmesh(bm)
-
-    BX_bevelVertex.debug_print_bevel_vertices(bevel_vertices)
-
-    return bevel_vertices

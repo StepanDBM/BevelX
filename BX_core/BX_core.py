@@ -11,7 +11,6 @@ from BX_build import BX_transaction
 from BX_build import BX_rebuild
 from BX_math import BX_offset
 from BX_profile import BX_debug
-from BX_boundary import BX_boundary
 from BX_profile import BX_log
 
 
@@ -86,25 +85,8 @@ def preview(settings=None):
 
             BX_bevelVertex.debug_print_bevel_vertices(session.bevel_vertices)
 
-            if session.bm:
-                BX_boundary.debug_print_bevel_vertex_topology_classification(
-                    session.bm,
-                    session.bevel_vertices
-                )
-            else:
-                BX_boundary.debug_print_bevel_vertex_classification(session.bevel_vertices)
-
-        printed_boundaries = False
-
         for edge_data in session.edges_data:
-            edge_id = edge_data["edge_id"]
-
             log_edge_data(edge_data)
-            vertex_boundaries = session.boundaries_by_edge_id.get(edge_id, {})
-
-            if not printed_boundaries:
-                BX_boundary.debug_print_boundaries(vertex_boundaries)
-                printed_boundaries = True
 
         if session.selection_transaction is not None:
             session.selection_transaction.debug_print()
